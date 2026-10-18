@@ -1,0 +1,159 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const packageJson = JSON.parse(
+  readFileSync(path.join(ROOT_DIR, 'package.json'), 'utf8'),
+);
+
+export const BOT_NAME = 'ΠΣXUS CΩRΣ';
+export const OWNER_DISPLAY = '☥ Ꮛ𝕸ᎮᏋ𝕽Ꭷ𝕽✞Ꮑ𝖀Ꮛ𝕷 ☥';
+export const FOOTER = `⚡ POWERED BY ${BOT_NAME}`;
+export const DEFAULT_WELCOME_TEMPLATE = [
+  '╭━━━〔 👹 DOMAIN INCARNATION 〕━━━╮',
+  '┃ 🔥 INTRUDER: {user}',
+  '┃ 👑 THRONE OCCUPANTS: {count}',
+  '┃ ⏳ ARRIVAL: {time}',
+  '╰━━━━━━━━━━━━━━━━━━━━╯',
+  '',
+  '👹 {user} HAS ENTERED THE DOMAIN.',
+  '',
+  '> Welcome to {group}.',
+  '',
+  '🩸 DOMAIN RULES:',
+  '',
+  '> {rules}',
+  '',
+  FOOTER,
+].join('\n');
+export const DEFAULT_GOODBYE_TEMPLATE = [
+  '╭━━━〔 ☠️ DOMAIN DEPARTURE 〕━━━╮',
+  '┃ 🩸 SOUL REMOVED: {user}',
+  '╰━━━━━━━━━━━━━━━━━━━━╯',
+  '',
+  '💀 {user} HAS LEFT THE DOMAIN.',
+  '',
+  '> One less soul. The King remains unmoved.',
+  '',
+  FOOTER,
+].join('\n');
+
+const DEFAULT_PROFANITY_WORDS = [
+  'fuck',
+  'shit',
+  'bitch',
+  'bastard',
+  'asshole',
+  'cunt',
+  'dickhead',
+  'motherfucker',
+];
+
+function bool(value, fallback = false) {
+  if (value === undefined || value === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+}
+
+function int(value, fallback, { min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function normalizePrefix(value, fallback = '!') {
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 3 || /\s/.test(trimmed)) return fallback;
+  return trimmed;
+}
+
+function normalizeJid(value) {
+  if (!value) return null;
+  const trimmed = String(value).trim();
+  if (!/^[^@\s]+@[^@\s]+$/.test(trimmed)) return null;
+  const [user, domain] = trimmed.split('@');
+  return `${user.split(':')[0]}@${domain}`;
+}
+
+export function createConfig(env = process.env) {
+  const authMethod = String(env.AUTH_METHOD || (env.PAIRING_NUMBER ? 'pairing' : 'qr')).toLowerCase();
+  const pairingNumber = String(env.PAIRING_NUMBER || '').replace(/[^\d]/g, '');
+
+  return Object.freeze({
+    rootDir: ROOT_DIR,
+    botName: BOT_NAME,
+    ownerDisplay: OWNER_DISPLAY,
+    footer: FOOTER,
+    version: packageJson.version,
+    baileysVersion: packageJson.dependencies['@whiskeysockets/baileys'],
+    prefix: normalizePrefix(env.PREFIX),
+    ownerJid: normalizeJid(env.OWNER_JID),
+    dbPath: path.resolve(ROOT_DIR, env.DB_PATH || 'data/nexus-core.db'),
+    sessionDir: path.resolve(ROOT_DIR, env.SESSION_DIR || 'data/session'),
+    commandsDir: path.resolve(ROOT_DIR, 'commands'),
+    logLevel: String(env.LOG_LEVEL || 'info').toLowerCase(),
+    timezone: env.TIMEZONE || 'UTC',
+    locale: env.LOCALE || 'en-GB',
+    auth: Object.freeze({
+      method: authMethod === 'pairing' ? 'pairing' : 'qr',
+      pairingNumber,
+    }),
+    reconnect: Object.freeze({
+      baseDelayMs: int(env.RECONNECT_BASE_MS, 3000, { min: 500, max: 60000 }),
+      maxDelayMs: int(env.RECONNECT_MAX_MS, 60000, { min: 1000, max: 300000 }),
+      maxAttempts: int(env.RECONNECT_MAX_ATTEMPTS, 12, { min: 1, max: 100 }),
+      jitter: 0.2,
+    }),
+    rateLimit: Object.freeze({
+      windowMs: int(env.RATE_WINDOW_MS, 10000, { min: 1000, max: 60000 }),
+      maxCommands: int(env.RATE_MAX_COMMANDS, 8, { min: 1, max: 100 }),
+      noticeCooldownMs: 15000,
+    }),
+    executionTimeoutMs: int(env.EXECUTION_TIMEOUT_MS, 20000, { min: 1000, max: 120000 }),
+    groupMetadataTtlMs: int(env.GROUP_METADATA_TTL_MS, 15000, { min: 1000, max: 120000 }),
+    security: Object.freeze({
+      spamWindowMs: int(env.SPAM_WINDOW_MS, 6000, { min: 1000, max: 60000 }),
+      spamThreshold: int(env.SPAM_THRESHOLD, 7, { min: 3, max: 50 }),
+      profanityWords: String(env.PROFANITY_WORDS || '')
+        .split(',')
+        .map((word) => word.trim().toLowerCase())
+        .filter(Boolean)
+        .concat(DEFAULT_PROFANITY_WORDS),
+      actionCooldownMs: int(env.SECURITY_ACTION_COOLDOWN_MS, 30000, { min: 5000, max: 300000 }),
+      maxMentions: int(env.MAX_MENTIONS, 120, { min: 10, max: 500 }),
+    }),
+    welcome: Object.freeze({
+      defaultText: env.DEFAULT_WELCOME_TEXT || DEFAULT_WELCOME_TEMPLATE,
+      defaultGoodbyeText: env.DEFAULT_GOODBYE_TEXT || DEFAULT_GOODBYE_TEMPLATE,
+    }),
+    ai: Object.freeze({
+      baseUrl: (env.AI_BASE_URL || '').replace(/\/+$/, ''),
+      apiKey: env.AI_API_KEY || '',
+      model: env.AI_MODEL || '',
+      timeoutMs: int(env.AI_TIMEOUT_MS, 30000, { min: 3000, max: 120000 }),
+      maxTokens: int(env.AI_MAX_TOKENS, 700, { min: 64, max: 4000 }),
+    }),
+    media: Object.freeze({
+      imageApiUrl: (env.IMAGE_API_URL || '').replace(/\/+$/, ''),
+      imageApiKey: env.IMAGE_API_KEY || '',
+      imageModel: env.IMAGE_MODEL || '',
+      timeoutMs: int(env.MEDIA_TIMEOUT_MS, 45000, { min: 5000, max: 120000 }),
+      waifuApiUrl: (env.WAIFU_API_URL || 'https://api.waifu.pics').replace(/\/+$/, ''),
+    }),
+    translation: Object.freeze({
+      apiUrl: (env.TRANSLATE_API_URL || '').replace(/\/+$/, ''),
+      apiKey: env.TRANSLATE_API_KEY || '',
+      timeoutMs: int(env.TRANSLATE_TIMEOUT_MS, 15000, { min: 3000, max: 60000 }),
+    }),
+    weather: Object.freeze({
+      geocodeUrl: 'https://geocoding-api.open-meteo.com/v1/search',
+      forecastUrl: 'https://api.open-meteo.com/v1/forecast',
+      timeoutMs: int(env.WEATHER_TIMEOUT_MS, 15000, { min: 3000, max: 60000 }),
+    }),
+    shrine: Object.freeze({
+      slogan: 'The King of Curses does not ask for obedience. He assumes it.',
+    }),
+    debug: bool(env.DEBUG, false),
+  });
+}
