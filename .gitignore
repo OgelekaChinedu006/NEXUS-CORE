@@ -196,5 +196,4 @@ node_modules/
 npm-debug.log*
 .DS_Store
 
-# Local image assets
-lib/assets/*.jpg
+
