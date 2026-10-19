@@ -314,6 +314,35 @@ test('per-user rate limits stop excess commands', async (t) => {
   assert.match(socket.sent[2].content.text, /THROTTLED/);
 });
 
+test('participant removals reach the game manager before goodbye notices', async (t) => {
+  const { socket, handler, games } = createHarness(t);
+  const departures = [];
+  const game = {
+    onText() {},
+    async onPlayerLeave(session, playerJid, api, input) {
+      departures.push({ session, playerJid, input });
+      api.end();
+      await api.send({ text: 'player left' });
+    },
+  };
+  const session = games.start(GROUP, { type: 'tictactoe', game, starterJid: MEMBER });
+
+  await handler.handleParticipants(socket, {
+    id: GROUP,
+    participants: [MEMBER],
+    action: 'remove',
+  });
+
+  assert.equal(departures.length, 1);
+  assert.equal(departures[0].session.id, session.id);
+  assert.equal(departures[0].playerJid, MEMBER);
+  assert.ok(departures[0].input.groupMeta);
+  assert.equal(departures[0].input.socket, socket);
+  assert.equal(games.hasSession(GROUP), false);
+  assert.equal(socket.sent.length, 1);
+  assert.equal(socket.sent[0].content.text, 'player left');
+});
+
 test('welcome and goodbye use real participant events and WhatsApp mentions', async (t) => {
   const { db, socket, handler } = createHarness(t);
   db.ensureGroup(GROUP, 'Test Domain');

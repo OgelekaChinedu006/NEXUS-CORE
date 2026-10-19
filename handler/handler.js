@@ -676,6 +676,14 @@ class MessageHandler {
     const group = this.db.ensureGroup(groupJid, groupMeta?.subject || null);
     const botJid = normalizeJid(socket.user?.id);
 
+    if (action === 'remove' && typeof this.games?.handlePlayerLeave === 'function') {
+      for (const participant of participants) {
+        const target = normalizeJid(participant);
+        if (!target) continue;
+        await this.games.handlePlayerLeave(groupJid, target, { socket, groupMeta });
+      }
+    }
+
     if (action === 'add') {
       for (const participant of participants) {
         const target = normalizeJid(participant);
