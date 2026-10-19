@@ -13,6 +13,7 @@ import {
 } from '../lib/helpers.js';
 import { isGroupAdmin, isBotAdmin, checkPermissions, describePermissions } from '../lib/permissions.js';
 import { warnUser } from '../lib/moderation.js';
+import { createGameManager } from '../lib/games/manager.js';
 
 const WRAPPER_KEYS = [
   'ephemeralMessage',
@@ -99,12 +100,12 @@ export function resolvePrefix({ group, db, config }) {
   return group?.prefix || db.getSetting('prefix', config.prefix) || config.prefix;
 }
 
-export function createHandler({ config, db, logger, registry, connection, services = {} }) {
-  return new MessageHandler({ config, db, logger, registry, connection, services });
+export function createHandler({ config, db, logger, registry, connection, services = {}, games }) {
+  return new MessageHandler({ config, db, logger, registry, connection, services, games });
 }
 
 class MessageHandler {
-  constructor({ config, db, logger, registry, connection, services }) {
+  constructor({ config, db, logger, registry, connection, services, games }) {
     this.config = config;
     this.db = db;
     this.logger = logger;
@@ -112,6 +113,7 @@ class MessageHandler {
     this.connection = connection;
     this.services = services;
     this.socket = null;
+    this.games = games || createGameManager({ getSocket: () => this.socket, logger });
     this.boundUpsert = null;
     this.boundParticipants = null;
     this.metadataCache = new Map();
@@ -162,6 +164,7 @@ class MessageHandler {
   }
 
   shutdown() {
+    this.games.shutdown();
     this.detach();
     clearInterval(this.pruneTimer);
   }
@@ -280,7 +283,23 @@ class MessageHandler {
       if (filtered) return;
     }
 
-    if (!parsed) return;
+    if (!parsed) {
+      await this.routeGameText({
+        socket,
+        msg,
+        chatJid,
+        isGroup,
+        senderJid,
+        botJid,
+        group,
+        groupMeta,
+        text,
+        isOwner,
+        isSudo,
+        isAdmin,
+      });
+      return;
+    }
 
     const command = this.registry.get(parsed.name);
     if (!command) {
@@ -419,6 +438,7 @@ class MessageHandler {
       registry: this.registry,
       connection: this.connection,
       services: this.services,
+      games: this.games,
       chatJid,
       isGroup,
       senderJid,
@@ -449,6 +469,49 @@ class MessageHandler {
         socket.sendMessage(chatJid, content, { quoted: msg, ...options }),
       refreshGroupMeta: () => this.getGroupMetadata(socket, chatJid, { force: true }),
     };
+  }
+
+  // Routes a plain (non-command) message to the chat's active game, if any.
+  // Runs after the ban, security-filter and parsing steps in processMessage, so
+  // it only re-applies the absence and sealed-group gates that normally sit
+  // after command lookup. Never throws.
+  async routeGameText({
+    socket,
+    msg,
+    chatJid,
+    isGroup,
+    senderJid,
+    botJid,
+    group,
+    groupMeta,
+    text,
+    isOwner,
+    isSudo,
+    isAdmin,
+  }) {
+    try {
+      if (!this.games.hasSession(chatJid)) return false;
+      if (typeof text !== 'string' || !text.trim()) return false;
+      if (this.db.getSettingBool('absence_enabled', false) && !isOwner && !isSudo) return false;
+      if (isGroup && group?.sealed && !isOwner && !isSudo && !isAdmin) return false;
+      return await this.games.handleText({
+        socket,
+        message: msg,
+        chatJid,
+        isGroup,
+        senderJid,
+        botJid,
+        group,
+        groupMeta,
+        text,
+        isOwner,
+        isSudo,
+        isAdmin,
+      });
+    } catch (error) {
+      this.logger.error(`Game routing failure: ${error.message}`);
+      return false;
+    }
   }
 
   async safeReply(socket, chatJid, msg, text, options = {}) {
