@@ -254,3 +254,30 @@ test('transfer moves funds atomically and rejects invalid requests', async (t) =
   ctx.args = ['10'];
   await assert.rejects(() => loaded.get('transfer').execute(ctx), /yourself/);
 });
+
+test('bank deposits, withdrawals and status keep wallet and bank consistent', async (t) => {
+  const loaded = await registry();
+  const { ctx, replies, db } = makeContext();
+  t.after(() => db.close());
+  db.creditBalance(SENDER, 200);
+
+  await loaded.get('bank').execute(ctx);
+  assert.match(replies[0].text, /WALLET: 200/);
+  assert.match(replies[0].text, /BANK: 0/);
+
+  ctx.args = ['deposit', '80'];
+  await loaded.get('bank').execute(ctx);
+  assert.equal(db.getEconomy(SENDER).balance, 120);
+  assert.equal(db.getEconomy(SENDER).bank_balance, 80);
+  assert.match(replies[1].text, /DEPOSIT/);
+
+  ctx.args = ['withdraw', '30'];
+  await loaded.get('bank').execute(ctx);
+  assert.equal(db.getEconomy(SENDER).balance, 150);
+  assert.equal(db.getEconomy(SENDER).bank_balance, 50);
+
+  ctx.args = ['deposit', '999'];
+  await assert.rejects(() => loaded.get('bank').execute(ctx), /wallet holds only 150/);
+  assert.equal(db.getEconomy(SENDER).balance, 150);
+  assert.equal(db.getEconomy(SENDER).bank_balance, 50);
+});
