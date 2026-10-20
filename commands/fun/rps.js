@@ -28,9 +28,9 @@ export default {
 
     const bot = pick(CHOICES);
     let verdict;
-    if (player === bot) verdict = '🤝 A draw. Neither side yields.';
-    else if (BEATS[player] === bot) verdict = `🏆 ${displayMention(ctx.senderJid)} wins.`;
-    else verdict = '💀 The bot wins.';
+    if (player === bot) verdict = '🤝 A draw. Neither side yields. How tedious.';
+    else if (BEATS[player] === bot) verdict = `🏆 ${displayMention(ctx.senderJid)} wins. Acceptable.`;
+    else verdict = '💀 The bot wins. As expected.';
 
     await ctx.reply(
       compactFrame('✊ ROCK PAPER SCISSORS', [

@@ -10,7 +10,7 @@ const ROOT = path.resolve(import.meta.dirname, '..');
 const logger = createLogger({ level: 'silent' });
 
 const PRIORITY_COMMANDS = [
-  'shrine', 'beg', 'pulse', 'manifest', 'eternity', 'sovereign', 'territory', 'dominion',
+  'arise', 'beg', 'pulse', 'manifest', 'eternity', 'sovereign', 'territory', 'dominion',
   'footprint', 'soulscan', 'vessel', 'oracle', 'sigil',
   'cleave', 'silence', 'release', 'ascend', 'crush', 'dismantle', 'summon', 'shadowtag',
   'condemn', 'pardon', 'domainlink',
@@ -102,29 +102,32 @@ test('every roadmap priority command is implemented and loadable', async () => {
   }
 });
 
-test('shrine renders a menu whose advertised count matches the registry', async () => {
+test('arise renders a menu whose advertised count matches the registry', async () => {
   const loaded = await registry();
+  assert.equal(loaded.get('arise'), loaded.get('menu'));
+  assert.equal(loaded.get('arise'), loaded.get('commands'));
+  assert.equal(loaded.get('shrine'), null);
   const { ctx, replies } = context({ registry: loaded, args: [], argsText: '' });
-  await loaded.get('shrine').execute(ctx);
+  await loaded.get('arise').execute(ctx);
   assert.equal(replies.length, 1);
-  assert.match(replies[0].text, new RegExp(`BOUND COMMANDS: ${loaded.size}`));
+  assert.match(replies[0].text, new RegExp(`COMMANDS: ${loaded.size}`));
   assert.match(replies[0].text, /SHRINE OF THE KING/);
   assert.match(replies[0].text, /!beg <command>/);
 });
 
-test('shrine filters categories and rejects unknown categories', async () => {
+test('arise filters categories and rejects unknown categories', async () => {
   const loaded = await registry();
   const filtered = context({
     registry: loaded,
     args: ['sovereign'],
     argsText: 'sovereign',
   });
-  await loaded.get('shrine').execute(filtered.ctx);
+  await loaded.get('arise').execute(filtered.ctx);
   assert.match(filtered.replies[0].text, /SOVEREIGN/);
   assert.match(filtered.replies[0].text, /!regime/);
 
   const unknown = context({ registry: loaded, args: ['nope'], argsText: 'nope' });
-  await loaded.get('shrine').execute(unknown.ctx);
+  await loaded.get('arise').execute(unknown.ctx);
   assert.match(unknown.replies[0].text, /UNKNOWN DOMAIN/);
   assert.match(unknown.replies[0].text, /Available domains/);
 });

@@ -306,7 +306,7 @@ class MessageHandler {
       if (this.throttleNotice(`unknown:${chatJid}:${senderJid}`, 10000)) {
         await this.safeReply(socket, chatJid, msg, compactFrame('☠️ UNKNOWN CURSE', [
           `No curse named "${truncate(parsed.name, 40)}" exists.`,
-          `Use ${prefix}shrine to witness the bound curses.`,
+          `Use ${prefix}arise to witness the bound curses.`,
         ]));
       }
       return;
@@ -700,10 +700,11 @@ class MessageHandler {
         }
 
         if (target === botJid) {
+          const prefix = resolvePrefix({ group, db: this.db, config: this.config });
           await this.safeReply(socket, groupJid, null, fullFrame('👹 DOMAIN CLAIMED', [
             `${this.config.botName} has taken residence.`,
-            `Prefix: ${resolvePrefix({ group, db: this.db, config: this.config })}`,
-            'Use the shrine to witness the bound curses.',
+            `Prefix: ${prefix}`,
+            `Use ${prefix}arise to witness the bound curses.`,
           ]));
           continue;
         }

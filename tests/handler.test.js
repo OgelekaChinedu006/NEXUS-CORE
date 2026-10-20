@@ -132,11 +132,12 @@ function createHarness(t, { commands = [makeCommand()], config = {}, groupMeta }
     connection,
     services: {},
   });
+  handler.attach(socket);
   t.after(() => {
     handler.shutdown();
     db.close();
   });
-  return { db, socket, handler };
+  return { db, socket, handler, games: handler.games };
 }
 
 test('bot messages, status broadcasts and newsletters are ignored', async (t) => {

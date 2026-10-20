@@ -98,11 +98,11 @@ function buildCaption(params) {
 }
 
 export default {
-  name: 'shrine',
+  name: 'arise',
   aliases: ['menu', 'commands'],
   description: 'Reveal every bound curse, grouped by domain.',
   category: 'general',
-  usage: 'shrine [category]',
+  usage: 'arise [category]',
   permissions: ['public'],
   cooldownMs: 3000,
   async execute(ctx) {
@@ -123,7 +123,7 @@ export default {
           `No category named "${filter}" is bound.`,
           '',
           'Available domains:',
-          ...categories.map((category) => `▸ ${category.label} — ${ctx.prefix}shrine ${category.id}`),
+          ...categories.map((category) => `▸ ${category.label} — ${ctx.prefix}arise ${category.id}`),
           '',
           `> ${ctx.prefix}beg <command> reveals a single curse.`,
         ]),

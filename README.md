@@ -7,7 +7,7 @@ A modular, self-hosted WhatsApp bot built with Node.js, ES modules, Baileys `7.0
 - Foundation, connection lifecycle, message handling, permissions, moderation, and visual identity are implemented.
 - All priority general, domain, security, and sovereign commands from the roadmap are implemented.
 - Economy core commands and the utility category are implemented.
-- The remaining catalogue is staged below. Unimplemented entries are not registered, so they never appear in `!shrine`.
+- The remaining catalogue is staged below. Unimplemented entries are not registered, so they never appear in `!arise`.
 - The automated suite covers parsing, permissions, database operations, formatting, connection backoff, handler behavior, priority commands, economy, and utility commands.
 
 The bot has not been connected to a live WhatsApp account in this environment. QR/pairing behavior is implemented against Baileys `7.0.0-rc14` but should be verified with a real device before deployment.
@@ -151,11 +151,11 @@ Owners and operators bypass group security wards. Allies bypass wards but do not
 
 ## Commands
 
-Use `!shrine` for the live list and `!beg <command>` for usage, aliases, permissions, and cooldown. The menu is generated from the registry, so the advertised count is always the real count.
+Use `!arise` for the live list and `!beg <command>` for usage, aliases, permissions, and cooldown. The menu is generated from the registry, so the advertised count is always the real count.
 
 Implemented categories and commands (61 total):
 
-- **General (13):** `shrine`, `beg`, `pulse`, `manifest`, `eternity`, `sovereign`, `territory`, `dominion`, `footprint`, `soulscan`, `vessel`, `oracle`, `sigil`
+- **General (13):** `arise`, `beg`, `pulse`, `manifest`, `eternity`, `sovereign`, `territory`, `dominion`, `footprint`, `soulscan`, `vessel`, `oracle`, `sigil`
 - **Domain control (16):** `cleave`, `silence`, `release`, `ascend`, `crush`, `dismantle`, `summon`, `shadowtag`, `condemn`, `pardon`, `domainlink`, `exile`, `liberate`, `lockdown`, `purge`, `edict`
 - **Security (13):** `malevolent`, `profanity`, `overwhelm`, `vigil`, `judgment`, `welcome`, `departure`, `farewell`, `law`, `doctrine`, `inscribe`, `seal`, `unseal`
 - **Sovereign (5):** `regime`, `edictor`, `reawaken`, `alliance`, `absence`
@@ -282,7 +282,7 @@ Current coverage:
 - [x] Entry point, SQLite initialization, Git exclusions
 - [x] Baileys `7.0.0-rc14`, persistent auth, QR/pairing, lifecycle, backoff, logout handling, graceful shutdown
 - [x] Message parsing, prefix/args, mentions, quotes, groups/direct, ignore rules, deduplication, containment, rate limits, timeouts
-- [x] Modular registry, metadata validation, permissions, dynamic `!shrine`, `!beg`, accurate menu
+- [x] Modular registry, metadata validation, permissions, dynamic `!arise`, `!beg`, accurate menu
 - [x] Priority general, domain, security, and sovereign commands
 - [x] Owner JID verification, moderation evidence, target validation, persisted settings, welcome/departure events
 - [x] Identity, themed frames, footer, templates

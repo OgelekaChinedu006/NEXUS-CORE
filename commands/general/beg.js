@@ -16,7 +16,7 @@ export default {
       await ctx.reply(
         fullFrame('☠️ BEG FOR KNOWLEDGE', [
           `Speak a curse name: ${ctx.prefix}beg <command>`,
-          `Witness every curse: ${ctx.prefix}shrine`,
+          `Witness every curse: ${ctx.prefix}arise`,
         ]),
       );
       return;
@@ -27,7 +27,7 @@ export default {
       await ctx.reply(
         fullFrame('☠️ NO SUCH CURSE', [
           `"${query}" is not bound to this vessel.`,
-          `Use ${ctx.prefix}shrine to see what actually exists.`,
+          `Use ${ctx.prefix}arise to see what actually exists.`,
         ]),
       );
       return;

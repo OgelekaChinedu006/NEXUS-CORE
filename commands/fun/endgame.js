@@ -13,7 +13,7 @@ export default {
   async execute(ctx) {
     const session = ctx.games?.get(ctx.chatJid) || null;
     if (!session) {
-      await ctx.reply(compactFrame('🎲 NO ACTIVE GAME', ['No game is running in this chat.']));
+      await ctx.reply(compactFrame('🎲 NO ACTIVE GAME', ['No game is running in this chat. Do not waste my time.']));
       return;
     }
 
@@ -28,6 +28,6 @@ export default {
     }
 
     ctx.games.end(ctx.chatJid);
-    await ctx.reply(compactFrame('🛑 GAME ENDED', [`The ${session.type} game has been ended.`]));
+    await ctx.reply(compactFrame('🛑 GAME ENDED', [`The ${session.type} game has been ended. Enough.`]));
   },
 };
