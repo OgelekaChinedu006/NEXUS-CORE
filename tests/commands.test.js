@@ -113,6 +113,31 @@ test('arise renders a menu whose advertised count matches the registry', async (
   assert.match(replies[0].text, new RegExp(`COMMANDS: ${loaded.size}`));
   assert.match(replies[0].text, /SHRINE OF THE KING/);
   assert.match(replies[0].text, /!beg <command>/);
+  assert.match(replies[0].text, /┣━━〔 ✦ SHRINE 〕\n┃\n┃ ⌁ !arise/);
+});
+
+test('arise image captions keep one command per line under the 1024 limit', async () => {
+  const loaded = await registry();
+  const contents = [];
+  const { ctx, replies } = context({ registry: loaded, args: [], argsText: '' });
+  ctx.replyContent = async (content) => {
+    contents.push(content);
+    return { ok: true };
+  };
+  await loaded.get('arise').execute(ctx);
+  assert.equal(replies.length, 0);
+  assert.equal(contents.length, 1);
+  assert.ok(contents[0].image?.url);
+  const caption = contents[0].caption;
+  assert.ok(caption.length <= 1024);
+  assert.match(caption, new RegExp(`COMMANDS: ${loaded.size}`));
+  assert.match(caption, /┣━━〔 ✦ SHRINE 〕\n┃\n!arise\n!beg/);
+  assert.match(caption, /!vessel\n┃\n┣━━〔 ✦ DOMAIN CONTROL 〕/);
+  assert.doesNotMatch(caption, /!arise, !beg/);
+  const listed = new Set(caption.split('\n').filter((line) => line.startsWith(ctx.prefix)));
+  for (const command of loaded.all()) {
+    assert.ok(listed.has(`${ctx.prefix}${command.name}`), `missing ${command.name}`);
+  }
 });
 
 test('arise filters categories and rejects unknown categories', async () => {

@@ -76,10 +76,27 @@ function buildCaption(params) {
   const withoutSlogan = [...header, ...sections, footer].join('\n');
   if (withoutSlogan.length <= CAPTION_LIMIT) return withoutSlogan;
 
-  const compactSections = categories.flatMap((category) => [
-    `┣━━〔 ✦ ${category.label.toUpperCase()} 〕`,
-    category.commands.map((command) => `${prefix}${command.name}`).join(', '),
-  ]);
+  const listedSections = [];
+  for (let i = 0; i < categories.length; i++) {
+    const category = categories[i];
+    if (i > 0) listedSections.push('┃');
+    listedSections.push(`┣━━〔 ✦ ${category.label.toUpperCase()} 〕`, '┃');
+    for (const command of category.commands) {
+      listedSections.push(`${prefix}${command.name}`);
+    }
+  }
+  const listed = [...header, ...listedSections, footer].join('\n');
+  if (listed.length <= CAPTION_LIMIT) return listed;
+
+  const compactSections = [];
+  for (let i = 0; i < categories.length; i++) {
+    const category = categories[i];
+    if (i > 0) compactSections.push('┃');
+    compactSections.push(
+      `┣━━〔 ✦ ${category.label.toUpperCase()} 〕`,
+      category.commands.map((command) => `${prefix}${command.name}`).join(', '),
+    );
+  }
   const compact = [...header, ...compactSections, footer].join('\n');
   if (compact.length <= CAPTION_LIMIT) return compact;
 
