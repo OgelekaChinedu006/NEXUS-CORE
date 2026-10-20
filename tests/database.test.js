@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { NexusDatabase } from '../lib/database.js';
+import { QuizHistoryStore } from '../lib/games/quiz-history.js';
 
 const GROUP = '120363000000000000@g.us';
 const USER = '111@s.whatsapp.net';
@@ -168,4 +169,27 @@ test('stats and audit records reflect the current database', (t) => {
   assert.equal(stats.warnings, 1);
   assert.equal(stats.operators, 1);
   db.logAudit('owner@s.whatsapp.net', 'test', USER, 'details');
+});
+
+test('quiz_cycles is created and stores remaining decks per user and kind', (t) => {
+  const db = freshDb(t);
+  const columns = db.db.prepare('PRAGMA table_info(quiz_cycles)').all().map((column) => column.name);
+  assert.deepEqual(columns, ['user_jid', 'kind', 'remaining', 'updated_at']);
+  const pk = db.db.prepare('PRAGMA table_info(quiz_cycles)').all().filter((column) => column.pk > 0);
+  assert.deepEqual(
+    pk.map((column) => column.name),
+    ['user_jid', 'kind'],
+  );
+
+  const bank = [
+    { prompt: 'One?', answers: ['1'], display: '1' },
+    { prompt: 'Two?', answers: ['2'], display: '2' },
+  ];
+  const first = db.quizHistory.takeNext(USER, 'trivia', bank, () => 0);
+  assert.ok(first.prompt);
+  assert.equal(db.quizHistory.getRemaining(USER, 'trivia').length, 1);
+  assert.deepEqual(db.quizHistory.getRemaining(USER, 'riddle'), []);
+  assert.deepEqual(db.quizHistory.getRemaining(OTHER, 'trivia'), []);
+  QuizHistoryStore.ensureSchema(db.db);
+  assert.equal(db.quizHistory.getRemaining(USER, 'trivia').length, 1);
 });

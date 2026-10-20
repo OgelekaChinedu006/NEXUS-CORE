@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
 import path from 'node:path';
 import { createGameManager } from '../lib/games/manager.js';
 import {
@@ -8,11 +9,14 @@ import {
   matchesAnswer,
   normalizeAnswer,
   processAnswer,
+  runQuizCommand,
   startQuiz,
   validateQuestion,
 } from '../lib/games/quiz.js';
 import { startGuess } from '../lib/games/guess.js';
 import { EMOJI_QUESTIONS, QUIZ_QUESTIONS, RIDDLES, TRIVIA_QUESTIONS } from '../lib/games/quiz-data.js';
+import { reconcileQuizCycle, shuffle } from '../lib/games/quiz-history.js';
+import { NexusDatabase } from '../lib/database.js';
 import { loadCommands } from '../lib/registry.js';
 import { createLogger } from '../lib/logger.js';
 import { CommandError } from '../lib/helpers.js';
@@ -544,4 +548,234 @@ test('registry loads the four quiz commands alongside Stage 2 and 3 commands wit
     assert.equal(command.category, 'fun');
   }
   assert.match(registry.get('quiz').source, /commands[\\/]fun[\\/]quiz\.js$/);
+});
+
+// ── persistent per-contact question history ─────────────────────────────────
+
+const ZERO = () => 0;
+const TEXT_BANK = [
+  { prompt: 'Alpha?', answers: ['a'], display: 'A' },
+  { prompt: 'Bravo?', answers: ['b'], display: 'B' },
+  { prompt: 'Charlie?', answers: ['c'], display: 'C' },
+];
+
+function historyDb(t, filePath = ':memory:') {
+  const db = new NexusDatabase(filePath);
+  t.after(() => db.close());
+  return db;
+}
+
+function draw(games, kind, { db, userJid = MEMBER, chatJid = GROUP, random = ZERO } = {}) {
+  if (games.hasSession(chatJid)) games.end(chatJid);
+  const session = startQuiz(games, chatJid, kind, { starterJid: userJid, db, userJid, random });
+  return session.data.question;
+}
+
+test('shuffle is a Fisher-Yates permutation of the bank', () => {
+  const source = ['A', 'B', 'C', 'D'];
+  assert.deepEqual(shuffle(source, ZERO), ['B', 'C', 'D', 'A']);
+  assert.deepEqual(source, ['A', 'B', 'C', 'D']);
+  assert.deepEqual(shuffle(source, () => 0.999999), ['A', 'B', 'C', 'D']);
+  const mixed = shuffle(source, () => 0.4);
+  assert.deepEqual([...mixed].sort(), source);
+  assert.equal(new Set(mixed).size, source.length);
+});
+
+test('the remaining deck shrinks as questions are presented, with no repeats before exhaustion', (t) => {
+  const db = historyDb(t);
+  const store = db.quizHistory;
+  const seen = [];
+  for (let index = 0; index < TEXT_BANK.length; index += 1) {
+    const question = store.takeNext(MEMBER, 'trivia', TEXT_BANK, ZERO);
+    assert.ok(question, `draw ${index}`);
+    assert.equal(seen.includes(question.prompt), false, question.prompt);
+    seen.push(question.prompt);
+    assert.equal(store.getRemaining(MEMBER, 'trivia').length, TEXT_BANK.length - index - 1);
+  }
+  assert.equal(seen.length, TEXT_BANK.length);
+  assert.deepEqual([...seen].sort(), TEXT_BANK.map((question) => question.prompt).sort());
+  assert.deepEqual(store.getRemaining(MEMBER, 'trivia'), []);
+});
+
+test('a new shuffled cycle starts after the bank is exhausted', (t) => {
+  const db = historyDb(t);
+  const store = db.quizHistory;
+  const firstCycle = TEXT_BANK.map(() => store.takeNext(MEMBER, 'trivia', TEXT_BANK, ZERO).prompt);
+  assert.deepEqual(firstCycle, shuffle(TEXT_BANK.map((question) => question.prompt), ZERO));
+  const secondCycle = TEXT_BANK.map(() => store.takeNext(MEMBER, 'trivia', TEXT_BANK, ZERO).prompt);
+  assert.deepEqual(secondCycle, firstCycle);
+  assert.equal(store.takeNext(MEMBER, 'trivia', TEXT_BANK, ZERO).prompt, firstCycle[0]);
+});
+
+test('a single-question bank repeats only after that cycle is exhausted', (t) => {
+  const db = historyDb(t);
+  const bank = [{ prompt: 'Only?', answers: ['x'], display: 'X' }];
+  assert.equal(db.quizHistory.takeNext(MEMBER, 'trivia', bank, ZERO).prompt, 'Only?');
+  assert.deepEqual(db.quizHistory.getRemaining(MEMBER, 'trivia'), []);
+  assert.equal(db.quizHistory.takeNext(MEMBER, 'trivia', bank, ZERO).prompt, 'Only?');
+});
+
+test('new bank entries are appended to the current cycle and removed entries are skipped', (t) => {
+  const db = historyDb(t);
+  const store = db.quizHistory;
+  const first = store.takeNext(MEMBER, 'trivia', TEXT_BANK, ZERO);
+  assert.equal(first.prompt, shuffle(TEXT_BANK.map((question) => question.prompt), ZERO)[0]);
+  assert.deepEqual(store.getRemaining(MEMBER, 'trivia'), ['Charlie?', 'Alpha?']);
+
+  const extra = { prompt: 'Delta?', answers: ['d'], display: 'D' };
+  const afterAdd = store.takeNext(MEMBER, 'trivia', [...TEXT_BANK, extra], ZERO);
+  assert.equal(afterAdd.prompt, 'Charlie?');
+  assert.deepEqual(store.getRemaining(MEMBER, 'trivia'), ['Alpha?', 'Delta?']);
+
+  const withoutCharlie = TEXT_BANK.filter((question) => question.prompt !== 'Charlie?').concat(extra);
+  const afterRemove = store.takeNext(MEMBER, 'trivia', withoutCharlie, ZERO);
+  assert.equal(afterRemove.prompt, 'Alpha?');
+  assert.deepEqual(store.getRemaining(MEMBER, 'trivia'), ['Delta?']);
+
+  const { remaining, cycle } = reconcileQuizCycle(
+    ['Charlie?', 'gone'],
+    ['Bravo?', 'Charlie?', 'Alpha?', 'gone'],
+    ['Alpha?', 'Bravo?', 'Delta?'],
+    ZERO,
+  );
+  assert.deepEqual(remaining, ['Delta?']);
+  assert.deepEqual(cycle, ['Bravo?', 'Alpha?', 'Delta?']);
+});
+
+test('history is isolated by contact and by category', (t) => {
+  const db = historyDb(t);
+  const store = db.quizHistory;
+  const one = store.takeNext(MEMBER, 'trivia', TEXT_BANK, ZERO);
+  const otherUser = store.takeNext(OTHER, 'trivia', TEXT_BANK, ZERO);
+  const otherKind = store.takeNext(MEMBER, 'riddle', TEXT_BANK, ZERO);
+  assert.equal(one.prompt, otherUser.prompt);
+  assert.equal(one.prompt, otherKind.prompt);
+  assert.equal(store.getRemaining(MEMBER, 'trivia').length, 2);
+  assert.equal(store.getRemaining(OTHER, 'trivia').length, 2);
+  assert.equal(store.getRemaining(MEMBER, 'riddle').length, 2);
+  assert.deepEqual(store.getRemaining(OTHER, 'riddle'), []);
+});
+
+test('startQuiz uses persistent history when db and userJid are provided', (t) => {
+  const db = historyDb(t);
+  const games = createGameManager({ logger: silent });
+  t.after(() => games.shutdown());
+  const seen = [];
+  for (let index = 0; index < TRIVIA_QUESTIONS.length; index += 1) {
+    const question = draw(games, 'trivia', { db });
+    assert.equal(seen.includes(question.prompt), false, question.prompt);
+    seen.push(question.prompt);
+  }
+  assert.equal(seen.length, TRIVIA_QUESTIONS.length);
+  assert.equal(db.quizHistory.getRemaining(MEMBER, 'trivia').length, 0);
+  const next = draw(games, 'trivia', { db });
+  assert.equal(next.prompt, seen[0]);
+});
+
+test('an explicit injected question bypasses history', (t) => {
+  const db = historyDb(t);
+  const games = createGameManager({ logger: silent });
+  t.after(() => games.shutdown());
+  const session = startQuiz(games, GROUP, 'trivia', {
+    starterJid: MEMBER,
+    question: TEXT_Q,
+    db,
+    userJid: MEMBER,
+  });
+  assert.equal(session.data.question, TEXT_Q);
+  assert.deepEqual(db.quizHistory.getRemaining(MEMBER, 'trivia'), []);
+  games.end(GROUP);
+  const drawn = startQuiz(games, GROUP, 'trivia', { starterJid: MEMBER, db, userJid: MEMBER, random: ZERO });
+  assert.notEqual(drawn.data.question, TEXT_Q);
+  assert.equal(db.quizHistory.getRemaining(MEMBER, 'trivia').length, TRIVIA_QUESTIONS.length - 1);
+});
+
+test('missing database keeps the legacy random-selection fallback', () => {
+  const games = createGameManager({ logger: silent });
+  const first = startQuiz(games, GROUP, 'trivia', { userJid: MEMBER, random: ZERO });
+  assert.equal(first.data.question, TRIVIA_QUESTIONS[0]);
+  games.shutdown();
+  const last = startQuiz(games, GROUP, 'trivia', { userJid: MEMBER, random: () => 0.999999 });
+  assert.equal(last.data.question, TRIVIA_QUESTIONS.at(-1));
+  games.shutdown();
+});
+
+test('the same starter shares one category deck across chats; another starter does not', (t) => {
+  const db = historyDb(t);
+  const games = createGameManager({ logger: silent });
+  t.after(() => games.shutdown());
+  const first = draw(games, 'trivia', { db, chatJid: GROUP });
+  const second = draw(games, 'riddle', { db, chatJid: '120363111111111111@g.us' });
+  const third = draw(games, 'trivia', { db, chatJid: '120363222222222222@g.us' });
+  assert.notEqual(first.prompt, third.prompt);
+  assert.equal(db.quizHistory.getRemaining(MEMBER, 'trivia').length, TRIVIA_QUESTIONS.length - 2);
+  assert.equal(db.quizHistory.getRemaining(MEMBER, 'riddle').length, RIDDLES.length - 1);
+  const other = draw(games, 'trivia', { db, userJid: OTHER, chatJid: '333@s.whatsapp.net' });
+  assert.equal(other.prompt, first.prompt);
+});
+
+test('history survives a restart from a real SQLite file', (t) => {
+  const filePath = path.join(os.tmpdir(), `nexus-quiz-history-${process.pid}-${Date.now()}.sqlite`);
+  const first = historyDb(t, filePath);
+  const games = createGameManager({ logger: silent });
+  t.after(() => games.shutdown());
+  const presented = draw(games, 'quiz', { db: first, random: ZERO });
+  const leftover = first.quizHistory.getRemaining(MEMBER, 'quiz');
+  assert.equal(leftover.length, QUIZ_QUESTIONS.length - 1);
+  first.close();
+
+  const second = historyDb(t, filePath);
+  assert.deepEqual(second.quizHistory.getRemaining(MEMBER, 'quiz'), leftover);
+  const next = draw(games, 'quiz', { db: second, random: ZERO });
+  assert.notEqual(next.prompt, presented.prompt);
+  assert.equal(second.quizHistory.getRemaining(MEMBER, 'quiz').length, QUIZ_QUESTIONS.length - 2);
+});
+
+test('concurrent selections do not deal the same remaining question', (t) => {
+  const filePath = path.join(os.tmpdir(), `nexus-quiz-concurrent-${process.pid}-${Date.now()}.sqlite`);
+  const left = historyDb(t, filePath);
+  const right = historyDb(t, filePath);
+  const first = left.quizHistory.takeNext(MEMBER, 'trivia', TEXT_BANK, ZERO);
+  const second = right.quizHistory.takeNext(MEMBER, 'trivia', TEXT_BANK, ZERO);
+  assert.notEqual(first.prompt, second.prompt);
+  const leftover = new Set([
+    ...left.quizHistory.getRemaining(MEMBER, 'trivia'),
+    ...right.quizHistory.getRemaining(MEMBER, 'trivia'),
+  ]);
+  leftover.add(first.prompt);
+  leftover.add(second.prompt);
+  assert.deepEqual([...leftover].sort(), TEXT_BANK.map((question) => question.prompt).sort());
+});
+
+test('runQuizCommand records history for the canonical starter, not the answerer', async (t) => {
+  const db = historyDb(t);
+  const games = createGameManager({ logger: silent });
+  t.after(() => games.shutdown());
+  const groupMeta = {
+    participants: [{ id: '5@lid', phoneNumber: '2348012345678@s.whatsapp.net' }, { id: OTHER }],
+  };
+  const { ctx, replies } = makeCtx(games, {
+    db,
+    groupMeta,
+    senderJid: '2348012345678@s.whatsapp.net',
+  });
+  await runQuizCommand(ctx, 'trivia');
+  assert.equal(replies.length, 1);
+  assert.equal(db.quizHistory.getRemaining('5@lid', 'trivia').length, TRIVIA_QUESTIONS.length - 1);
+  assert.deepEqual(db.quizHistory.getRemaining('2348012345678@s.whatsapp.net', 'trivia'), []);
+  assert.deepEqual(db.quizHistory.getRemaining(OTHER, 'trivia'), []);
+  games.end(GROUP);
+
+  const { ctx: again } = makeCtx(games, { db, groupMeta, senderJid: '5@lid' });
+  await trivia.execute(again);
+  assert.equal(db.quizHistory.getRemaining('5@lid', 'trivia').length, TRIVIA_QUESTIONS.length - 2);
+});
+
+test('a refused start does not consume a history question', (t) => {
+  const db = historyDb(t);
+  const { games } = setup('trivia');
+  t.after(() => games.shutdown());
+  assert.throws(() => startQuiz(games, GROUP, 'riddle', { db, userJid: MEMBER, random: ZERO }), CommandError);
+  assert.deepEqual(db.quizHistory.getRemaining(MEMBER, 'riddle'), []);
+  assert.deepEqual(db.quizHistory.getRemaining(MEMBER, 'trivia'), []);
 });
