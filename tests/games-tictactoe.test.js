@@ -99,8 +99,25 @@ test('createBoard starts empty and renderBoard labels every empty cell', () => {
   assert.equal(board.length, 9);
   assert.ok(board.every((cell) => cell === null));
   const rendered = renderBoard(board);
-  for (let cell = 1; cell <= 9; cell += 1) assert.match(rendered, new RegExp(String(cell)));
-  assert.match(rendered, /1 \| 2 \| 3/);
+  assert.equal(
+    rendered,
+    ['1️⃣ | 2️⃣ | 3️⃣', '---------', '4️⃣ | 5️⃣ | 6️⃣', '---------', '7️⃣ | 8️⃣ | 9️⃣'].join('\n'),
+  );
+});
+
+test('renderBoard maps emoji numbers to existing cell indices and shows player symbols', () => {
+  const board = createBoard();
+  board[0] = 'X';
+  board[4] = 'O';
+  board[8] = 'X';
+  const rendered = renderBoard(board);
+  const rows = rendered.split('\n').filter((line) => !line.startsWith('-'));
+  assert.equal(rows[0], '❌ | 2️⃣ | 3️⃣');
+  assert.equal(rows[1], '4️⃣ | ⭕ | 6️⃣');
+  assert.equal(rows[2], '7️⃣ | 8️⃣ | ❌');
+  assert.equal(board[0], 'X');
+  assert.equal(board[4], 'O');
+  assert.equal(board[8], 'X');
 });
 
 test('findWinner detects every row, column and diagonal', () => {
@@ -183,12 +200,14 @@ test('start and status messages show the board, both players and whose turn it i
   assert.match(start, /@222 is O/);
   assert.match(start, /1 to 9/);
   assert.match(start, /TURN: X/);
+  assert.match(start, /(?<!▸ )1️⃣ \| 2️⃣ \| 3️⃣\n---------\n4️⃣ \| 5️⃣ \| 6️⃣\n---------\n7️⃣ \| 8️⃣ \| 9️⃣/);
 
   processMove(session, 5, MEMBER);
   const status = describeTicTacToeStatus(session);
   assert.match(status, /IN PROGRESS/);
   assert.match(status, /TURN: O/);
   assert.match(status, /@222/);
+  assert.match(status, /4️⃣ \| ❌ \| 6️⃣/);
 });
 
 test('the starter is recognised through LID and phone aliases', () => {
