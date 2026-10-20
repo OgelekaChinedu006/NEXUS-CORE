@@ -14,6 +14,12 @@ import {
   startWordChain,
   startsWithLetter,
 } from '../lib/games/wordchain.js';
+import {
+  WORD_CHAIN_WORD_LIST_PATH,
+  isKnownWord,
+  loadWordSet,
+  parseWordList,
+} from '../lib/games/wordchain-dictionary.js';
 import { loadCommands } from '../lib/registry.js';
 import { createLogger } from '../lib/logger.js';
 import { CommandError } from '../lib/helpers.js';
@@ -86,6 +92,42 @@ test('parseWord accepts only a bare 3-32 letter word', () => {
   for (const text of ['to', 'a'.repeat(33), 'cat!', 'two words', 'c4t', '', '   ', '123', null, undefined, 5]) {
     assert.equal(parseWord(text), null, String(text));
   }
+});
+
+test('parseWordList loads unique lowercase 3-32 letter words and ignores comments', () => {
+  const words = parseWordList([
+    '# ENABLE public domain fixture',
+    '',
+    'cat',
+    'TIGER',
+    'aa',
+    'qqq',
+    'apple',
+    'apple',
+    'two words',
+    'c4t',
+    `${'a'.repeat(33)}`,
+  ].join('\n'));
+  assert.deepEqual([...words].sort(), ['apple', 'cat', 'qqq', 'tiger']);
+});
+
+test('isKnownWord checks a supplied set or the ENABLE list', () => {
+  const fixture = new Set(['cat', 'tiger']);
+  assert.equal(isKnownWord('CAT', fixture), true);
+  assert.equal(isKnownWord('qqq', fixture), false);
+  assert.equal(isKnownWord('cat'), true);
+  assert.equal(isKnownWord('tiger'), true);
+  assert.equal(isKnownWord('apple'), true);
+  assert.equal(isKnownWord('tonic'), true);
+  assert.equal(isKnownWord('qqq'), false);
+  assert.equal(isKnownWord('to'), false);
+});
+
+test('loadWordSet reads the vendored ENABLE list', () => {
+  const words = loadWordSet(WORD_CHAIN_WORD_LIST_PATH);
+  assert.ok(words.size > 100_000);
+  assert.equal(words.has('cat'), true);
+  assert.equal(words.has('qqq'), false);
 });
 
 test('normalizeWord, lastLetter and startsWithLetter are case-insensitive', () => {
@@ -211,6 +253,33 @@ test('an out-of-turn player cannot play and a used or mismatched word is rejecte
   assert.equal(games.get(GROUP), session);
 });
 
+test('an unknown word is rejected without changing the chain or turn', () => {
+  const { games, session } = setup();
+  const outcome = processWord(session, 'qqq', MEMBER);
+  assert.equal(outcome.kind, 'unknown');
+  assert.match(outcome.text, /UNKNOWN/);
+  assert.equal(session.data.lastWord, null);
+  assert.equal(session.data.lastLetter, null);
+  assert.equal(session.data.chain.length, 0);
+  assert.equal(session.data.used.size, 0);
+  assert.equal(session.data.turnIndex, 0);
+  assert.equal(session.ended, false);
+  games.shutdown();
+});
+
+test('processWord accepts a supplied dictionary for validation', () => {
+  const { games, session } = setup();
+  const words = new Set(['cat', 'tiger']);
+  const unknown = processWord(session, 'dog', MEMBER, { words });
+  assert.equal(unknown.kind, 'unknown');
+  assert.equal(session.data.chain.length, 0);
+  const accepted = processWord(session, 'cat', MEMBER, { words });
+  assert.equal(accepted.kind, 'word');
+  assert.equal(session.data.lastWord, 'cat');
+  assert.equal(session.data.turnIndex, 1);
+  games.shutdown();
+});
+
 test('spectators, chatter and invalid tokens are ignored', async () => {
   const { games, session, socket } = setup();
   for (const text of ['hello world', 'to', 'cat!', 'ok', '123', 'a'.repeat(33)]) {
@@ -315,6 +384,19 @@ test('a valid word restarts the turn deadline', async (t) => {
   await Promise.resolve();
   assert.equal(games.hasSession(GROUP), false);
   assert.match(socket.sent.at(-1).content.text, /VICTORY|TIMED OUT|CANCELLED/);
+});
+
+test('an unknown word does not reset the turn deadline', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { games, session, socket } = setup({ turnTimeoutMs: 1000 });
+  t.mock.timers.tick(800);
+  await say(games, 'qqq', { senderJid: MEMBER });
+  assert.match(socket.sent.at(-1).content.text, /UNKNOWN/);
+  assert.equal(session.data.turnIndex, 0);
+  assert.equal(session.data.chain.length, 0);
+  t.mock.timers.tick(200);
+  await Promise.resolve();
+  assert.equal(games.hasSession(GROUP), false);
 });
 
 test('an invalid word does not reset the turn deadline', async (t) => {

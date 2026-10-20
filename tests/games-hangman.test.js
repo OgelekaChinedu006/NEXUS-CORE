@@ -108,13 +108,29 @@ test('isHangmanWord, isHangmanLetter and command helpers', () => {
 });
 
 test('the built-in word list contains only unique 4-10 letter words', () => {
-  assert.ok(HANGMAN_WORDS.length > 20);
+  assert.ok(HANGMAN_WORDS.length >= 280);
+  assert.ok(HANGMAN_WORDS.length <= 320);
   const seen = new Set();
   for (const word of HANGMAN_WORDS) {
     assert.equal(isHangmanWord(word), true, word);
+    assert.equal(/^[a-z]{4,10}$/.test(word), true, word);
     assert.equal(seen.has(word), false, word);
     seen.add(word);
   }
+});
+
+test('startHangman without an answer picks from the bank using the given random source', () => {
+  const games = createGameManager({ logger: silent });
+  const first = startHangman(games, GROUP, { starterJid: MEMBER, random: () => 0 });
+  assert.equal(first.data.answer, HANGMAN_WORDS[0]);
+  assert.equal(HANGMAN_WORDS.includes(first.data.answer), true);
+  games.shutdown();
+
+  const other = createGameManager({ logger: silent });
+  const last = startHangman(other, OTHER_GROUP, { starterJid: MEMBER, random: () => 0.999999999 });
+  assert.equal(last.data.answer, HANGMAN_WORDS[HANGMAN_WORDS.length - 1]);
+  assert.equal(HANGMAN_WORDS.includes(last.data.answer), true);
+  other.shutdown();
 });
 
 test('maskWord reveals every occurrence of guessed letters and hides the rest', () => {
