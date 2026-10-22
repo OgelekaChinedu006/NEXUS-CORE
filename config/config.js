@@ -394,13 +394,35 @@ export function createConfig(env = process.env) {
       defaultText: env.DEFAULT_WELCOME_TEXT || DEFAULT_WELCOME_TEMPLATE,
       defaultGoodbyeText: env.DEFAULT_GOODBYE_TEXT || DEFAULT_GOODBYE_TEMPLATE,
     }),
+    
     ai: Object.freeze({
+      provider: String(
+        env.AI_PROVIDER ||
+          (env.GROQ_API_KEY || env.GROQ_API_KEY_2 ? 'groq' : 'custom'),
+      ).trim().toLowerCase(),
+      
+      groqApiKey: env.GROQ_API_KEY || '',
+      groqApiKey2: env.GROQ_API_KEY_2 || '',
+      cerebrasApiKey: env.CEREBRAS_API_KEY || '',
+      
+      
+    
+      // Legacy custom OpenAI-compatible provider support.
       baseUrl: (env.AI_BASE_URL || '').replace(/\/+$/, ''),
       apiKey: env.AI_API_KEY || '',
       model: env.AI_MODEL || '',
-      timeoutMs: int(env.AI_TIMEOUT_MS, 30000, { min: 3000, max: 120000 }),
-      maxTokens: int(env.AI_MAX_TOKENS, 700, { min: 64, max: 4000 }),
+    
+      timeoutMs: int(env.AI_TIMEOUT_MS, 30000, {
+        min: 3000,
+        max: 120000,
+      }),
+      maxTokens: int(env.AI_MAX_TOKENS, 700, {
+        min: 64,
+        max: 4000,
+      }),
     }),
+
+
     media: Object.freeze({
       imageApiUrl: (env.IMAGE_API_URL || '').replace(/\/+$/, ''),
       imageApiKey: env.IMAGE_API_KEY || '',

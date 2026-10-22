@@ -9,7 +9,7 @@ const FOOTER = 'POWERED BY TEST';
 
 test('fullFrame renders a bounded frame, body and footer', () => {
   const output = fullFrame('TITLE', ['first', ['second', 'third'], ''], { footer: FOOTER });
-  assert.match(output, /^╭━━━〔 TITLE 〕━━━╮/);
+  assert.match(output, /^╭━━『 TITLE 』━━╮/);
   assert.match(output, /┃ first/);
   assert.match(output, /┃ second/);
   assert.match(output, /┃ third/);
