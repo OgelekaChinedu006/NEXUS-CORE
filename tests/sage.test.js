@@ -286,6 +286,7 @@ test('createServices registers Sage separately without replacing existing servic
     [
       'ai',
       'anime',
+      'isis',
       'media',
       'odin',
       'omen',
