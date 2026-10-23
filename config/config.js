@@ -428,6 +428,9 @@ export function createConfig(env = process.env) {
     omen: Object.freeze({
       apiKey: env.GROQ_API_KEY_OMEN || '',
     }),
+    isis: Object.freeze({
+      unsplashAccessKey: env.UNSPLASH_ACCESS_KEY || '',
+    }),
 
     media: Object.freeze({
       imageApiUrl: (env.IMAGE_API_URL || '').replace(/\/+$/, ''),

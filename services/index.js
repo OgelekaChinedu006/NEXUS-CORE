@@ -7,6 +7,8 @@ import { UtilityService } from './utilities.js';
 import { ThothService } from './thoth.js';
 import { OdinService } from './odin.js';
 import { OmenService } from './omen.js';
+import { SageService } from './sage.js';
+import { IsisService } from './isis.js';
 
 
 export function createServices(config, logger) {
@@ -15,6 +17,8 @@ export function createServices(config, logger) {
     thoth: new ThothService(config, logger),
     odin: new OdinService(config, logger),
     omen: new OmenService(config, logger),
+    sage: new SageService(config, logger),
+    isis: new IsisService(config, logger),
     media: new MediaService(config, logger),
     anime: new AnimeService(logger),
     weather: new WeatherService(config),
