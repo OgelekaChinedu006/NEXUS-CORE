@@ -584,3 +584,162 @@ test('custom provider failures are not retried and keep their error mapping', as
   );
   assert.equal(calls, 2);
 });
+
+// ---------------------------------------------------------------------------
+// Token-limit validation. Policy: a caller limit is valid only if it is a
+// finite number (or numeric string) of at least 1; it is floored to a whole
+// number. Anything else is treated as omitted and falls back to the
+// configured default; if that is invalid too, to the Groq policy cap (1200)
+// or the custom-provider ceiling (4000).
+// ---------------------------------------------------------------------------
+
+const INVALID_TOKEN_LIMITS = [
+  ['zero', 0],
+  ['negative', -5],
+  ['NaN', Number.NaN],
+  ['Infinity', Number.POSITIVE_INFINITY],
+  ['-Infinity', Number.NEGATIVE_INFINITY],
+  ['fraction below one', 0.5],
+  ['non-numeric string', 'abc'],
+  ['empty string', ''],
+  ['whitespace string', '   '],
+  ['null', null],
+  ['boolean', true],
+  ['object', {}],
+  ['array', [300]],
+];
+
+for (const [label, value] of INVALID_TOKEN_LIMITS) {
+  test(`Groq treats an invalid maxTokens (${label}) as omitted and uses the configured default`, async (t) => {
+    const service = makeService();
+    const calls = recordRequests(t, () => successResponse());
+
+    await service.chat({ prompt: 'Invalid limit', maxTokens: value });
+
+    assert.equal(calls[0].body.max_completion_tokens, 700);
+    assert.ok(Number.isInteger(calls[0].body.max_completion_tokens));
+    assert.equal('max_tokens' in calls[0].body, false);
+  });
+
+  test(`custom provider treats an invalid maxTokens (${label}) as omitted and uses the configured default`, async (t) => {
+    const service = makeService({
+      provider: 'custom',
+      baseUrl: 'https://example.test/v1/',
+      apiKey: 'test-custom-key',
+      model: 'custom-model',
+    });
+    const calls = recordRequests(t, () => successResponse());
+
+    await service.chat({ prompt: 'Invalid limit', maxTokens: value });
+
+    assert.equal(calls[0].body.max_tokens, 700);
+    assert.ok(Number.isInteger(calls[0].body.max_tokens));
+  });
+}
+
+test('Groq accepts valid limits, floors fractions, accepts numeric strings and caps at 1200', async (t) => {
+  const service = makeService();
+  const calls = recordRequests(t, () => successResponse());
+  const requested = [1, 300, '300', 150.9, 1200, 1201, 5000];
+
+  for (const maxTokens of requested) {
+    await service.chat({ prompt: 'Valid limit', maxTokens });
+  }
+
+  assert.deepEqual(
+    calls.map((call) => call.body.max_completion_tokens),
+    [1, 300, 300, 150, 1200, 1200, 1200],
+  );
+});
+
+test('Groq request body keeps exactly its existing fields', async (t) => {
+  const service = makeService();
+  const calls = recordRequests(t, () => successResponse());
+
+  await service.chat({ prompt: 'Shape', maxTokens: 0, temperature: 0.3 });
+
+  assert.deepEqual(Object.keys(calls[0].body).sort(), [
+    'max_completion_tokens',
+    'messages',
+    'model',
+    'reasoning_effort',
+    'temperature',
+  ]);
+  assert.equal(calls[0].body.temperature, 0.3);
+  assert.equal(calls[0].body.reasoning_effort, 'medium');
+});
+
+test('Groq falls back to the 1200 policy cap when both the caller and the configured default are invalid', async (t) => {
+  const calls = recordRequests(t, () => successResponse());
+
+  await makeService({ maxTokens: undefined }).chat({
+    prompt: 'No default',
+    maxTokens: 0,
+  });
+  await makeService({ maxTokens: 0 }).chat({ prompt: 'Zero default' });
+
+  assert.deepEqual(
+    calls.map((call) => call.body.max_completion_tokens),
+    [1200, 1200],
+  );
+});
+
+test('Groq fallback requests also use the validated limit', async (t) => {
+  const service = makeService();
+  const calls = recordRequests(t, (_call, index) =>
+    index === 1
+      ? new Response('Temporary server failure', { status: 503 })
+      : successResponse(),
+  );
+
+  await service.chat({ prompt: 'Fallback limit', maxTokens: -10 });
+
+  assert.equal(calls.length, 2);
+
+  for (const call of calls) {
+    assert.equal(call.body.max_completion_tokens, 700);
+    assert.equal(call.body.reasoning_effort, 'medium');
+  }
+});
+
+test('custom provider keeps legacy max_tokens behaviour: valid values, 4000 ceiling, no Groq fields', async (t) => {
+  const service = makeService({
+    provider: 'custom',
+    baseUrl: 'https://example.test/v1/',
+    apiKey: 'test-custom-key',
+    model: 'custom-model',
+  });
+  const calls = recordRequests(t, () => successResponse());
+
+  await service.chat({ prompt: 'Omitted' });
+  await service.chat({ prompt: 'Valid', maxTokens: 3000 });
+  await service.chat({ prompt: 'Above ceiling', maxTokens: 5000 });
+  await service.chat({ prompt: 'Numeric string', maxTokens: '300' });
+  await service.chat({ prompt: 'Fraction', maxTokens: 150.9 });
+
+  assert.deepEqual(
+    calls.map((call) => call.body.max_tokens),
+    [700, 3000, 4000, 300, 150],
+  );
+  assert.deepEqual(Object.keys(calls[0].body).sort(), [
+    'max_tokens',
+    'messages',
+    'model',
+    'temperature',
+  ]);
+});
+
+test('custom provider falls back to the 4000 ceiling when both limits are invalid', async (t) => {
+  const service = makeService({
+    provider: 'custom',
+    baseUrl: 'https://example.test/v1/',
+    apiKey: 'test-custom-key',
+    model: 'custom-model',
+    maxTokens: undefined,
+  });
+  const calls = recordRequests(t, () => successResponse());
+
+  await service.chat({ prompt: 'No default', maxTokens: Number.NaN });
+
+  assert.equal(calls[0].body.max_tokens, 4000);
+});

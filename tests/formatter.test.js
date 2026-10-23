@@ -49,7 +49,7 @@ test('menu advertises only supplied categories and the real total', () => {
       },
     ],
   });
-  assert.match(output, /^╭━━━〔 TEST CORE 〕━━━╮/);
+  assert.match(output, /^╭━━『 TEST CORE 』━━╮/);
   assert.match(output, /◈ VESSEL: TEST CORE/);
   assert.match(output, /◈ PREFIX: !/);
   assert.match(output, /◈ VERSION: 1\.0\.0/);

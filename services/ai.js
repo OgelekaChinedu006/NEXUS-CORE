@@ -19,7 +19,7 @@ function chatEndpoint(baseUrl) {
   return `${normalizedBaseUrl}/chat/completions`;
 }
 
-class AIRequestFailure extends Error {
+export class AIRequestFailure extends Error {
   constructor(message, { retryable = false, status = 0, cause } = {}) {
     super(message, { cause });
     this.name = 'AIRequestFailure';
@@ -28,7 +28,22 @@ class AIRequestFailure extends Error {
   }
 }
 
-function toCommandError(error) {
+// Validate token limits before sending them to an AI provider.
+function normalizeTokenLimit(value) {
+  const number =
+    typeof value === 'string' && value.trim() !== ''
+      ? Number(value)
+      : value;
+
+  if (typeof number !== 'number' || !Number.isFinite(number)) {
+    return null;
+  }
+
+  const whole = Math.floor(number);
+  return whole >= 1 ? whole : null;
+}
+
+export function toCommandError(error) {
   if (error.status === 401 || error.status === 403) {
     return new CommandError(
       'The AI credentials were rejected. Check the configured API key.',
@@ -139,14 +154,16 @@ export class AIService {
   // (max_completion_tokens + reasoning_effort); custom providers keep
   // the legacy max_tokens behaviour with the original 4000 ceiling.
   buildBody({ model, messages, maxTokens, temperature, groqPolicy }) {
-    const requested = maxTokens || this.config.maxTokens;
+    const requested =
+      normalizeTokenLimit(maxTokens) ??
+      normalizeTokenLimit(this.config.maxTokens);
 
     if (groqPolicy) {
       return {
         model,
         messages,
         max_completion_tokens: Math.min(
-          requested,
+          requested ?? groqPolicy.maxCompletionTokens,
           groqPolicy.maxCompletionTokens,
         ),
         reasoning_effort: groqPolicy.reasoningEffort,
@@ -157,7 +174,7 @@ export class AIService {
     return {
       model,
       messages,
-      max_tokens: Math.min(requested, 4000),
+      max_tokens: Math.min(requested ?? 4000, 4000),
       temperature,
     };
   }
