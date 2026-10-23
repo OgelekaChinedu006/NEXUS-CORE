@@ -9,7 +9,7 @@ const FOOTER = 'POWERED BY TEST';
 
 test('fullFrame renders a bounded frame, body and footer', () => {
   const output = fullFrame('TITLE', ['first', ['second', 'third'], ''], { footer: FOOTER });
-  assert.match(output, /^╭━━━〔 TITLE 〕━━━╮/);
+  assert.match(output, /^╭━━『 TITLE 』━━╮/);
   assert.match(output, /┃ first/);
   assert.match(output, /┃ second/);
   assert.match(output, /┃ third/);
@@ -49,7 +49,7 @@ test('menu advertises only supplied categories and the real total', () => {
       },
     ],
   });
-  assert.match(output, /^╭━━━〔 TEST CORE 〕━━━╮/);
+  assert.match(output, /^╭━━『 TEST CORE 』━━╮/);
   assert.match(output, /◈ VESSEL: TEST CORE/);
   assert.match(output, /◈ PREFIX: !/);
   assert.match(output, /◈ VERSION: 1\.0\.0/);

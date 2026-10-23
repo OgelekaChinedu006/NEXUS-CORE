@@ -8,6 +8,7 @@ import {
   createBoard,
   describeTicTacToeStart,
   describeTicTacToeStatus,
+  exitTicTacToe,
   findWinner,
   getWinningLine,
   isDraw,
@@ -16,6 +17,7 @@ import {
   processMove,
   renderBoard,
   startTicTacToe,
+  surrenderTicTacToe,
 } from '../lib/games/tictactoe.js';
 import { loadCommands } from '../lib/registry.js';
 import { createLogger } from '../lib/logger.js';
@@ -151,6 +153,7 @@ test('startTicTacToe registers a two-player session with X to move and a turn ti
   assert.equal(session.data.xJid, MEMBER);
   assert.equal(session.data.oJid, OTHER);
   assert.equal(session.data.turn, 'X');
+  assert.equal(TIC_TAC_TOE_TURN_MS, 60_000);
   assert.equal(session.data.turnTimeoutMs, TIC_TAC_TOE_TURN_MS);
   assert.equal(session.data.moves, 0);
   assert.equal(games.get(GROUP), session);
@@ -401,6 +404,20 @@ test('a valid X move in an open game resets the turn deadline', async (t) => {
   assert.match(socket.sent.at(-1).content.text, /TIMED OUT/);
 });
 
+test('a successful join resets the inactivity deadline even when it is still X to move', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { games, socket } = setup({ opponentJid: null, turnTimeoutMs: 1000 });
+  t.mock.timers.tick(800);
+  await say(games, 'join', { senderJid: OTHER });
+  assert.equal(games.get(GROUP).data.oJid, OTHER);
+  t.mock.timers.tick(800);
+  assert.equal(games.hasSession(GROUP), true);
+  t.mock.timers.tick(200);
+  await Promise.resolve();
+  assert.equal(games.hasSession(GROUP), false);
+  assert.match(socket.sent.at(-1).content.text, /TIMED OUT/);
+});
+
 test('an occupied-cell attempt does not reset the turn deadline', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const { games, session, socket } = setup({ turnTimeoutMs: 1000 });
@@ -584,4 +601,160 @@ test('the command works in a direct chat with an open seat', async () => {
   assert.equal(games.get(MEMBER).type, 'tictactoe');
   assert.equal(games.get(MEMBER).data.oJid, null);
   games.shutdown();
+});
+
+// ── surrender ───────────────────────────────────────────────────────────────
+
+test('a seated player can surrender and the opponent wins by forfeit', async () => {
+  const { games, socket } = setup();
+  await say(games, 'surrender', { senderJid: MEMBER });
+  assert.equal(games.hasSession(GROUP), false);
+  assert.match(socket.sent[0].content.text, /FORFEIT/);
+  assert.match(socket.sent[0].content.text, /@111 left/);
+  assert.match(socket.sent[0].content.text, /@222 wins by forfeit/);
+  assert.deepEqual(socket.sent[0].content.mentions, [MEMBER, OTHER]);
+});
+
+test('surrendering an open game cancels it without awarding a win', async () => {
+  const { games, socket } = setup({ opponentJid: null });
+  await say(games, 'surrender', { senderJid: MEMBER });
+  assert.equal(games.hasSession(GROUP), false);
+  assert.match(socket.sent[0].content.text, /CANCELLED/);
+  assert.doesNotMatch(socket.sent[0].content.text, /wins by forfeit/);
+});
+
+test('the second player can surrender after joining', () => {
+  const { games, session } = setup();
+  const outcome = surrenderTicTacToe(session, OTHER);
+  assert.equal(outcome.kind, 'forfeit');
+  assert.match(outcome.text, /@222 left/);
+  assert.match(outcome.text, /@111 wins by forfeit/);
+  assert.equal(games.hasSession(GROUP), false);
+});
+
+test('spectators cannot surrender and the session stays active', async () => {
+  const { games, session, socket } = setup();
+  assert.equal(surrenderTicTacToe(session, SPECTATOR), null);
+  await say(games, 'surrender', { senderJid: SPECTATOR });
+  assert.equal(games.get(GROUP), session);
+  assert.equal(socket.sent.length, 0);
+  assert.equal(session.ended, false);
+});
+
+test('the command surrenders for a seated player and refuses spectators', async () => {
+  const { games } = setup();
+  const surrender = makeCtx(games, { args: ['surrender'], argsText: 'surrender', senderJid: OTHER });
+  await tictactoeCommand.execute(surrender.ctx);
+  assert.equal(games.hasSession(GROUP), false);
+  assert.match(surrender.replies[0].text, /FORFEIT/);
+
+  const { games: open } = setup({ opponentJid: null });
+  const spectator = makeCtx(open, { args: ['surrender'], argsText: 'surrender', senderJid: SPECTATOR });
+  await assert.rejects(() => tictactoeCommand.execute(spectator.ctx), CommandError);
+  assert.equal(open.hasSession(GROUP), true);
+  open.shutdown();
+});
+
+test('surrendering twice does not emit a second result', () => {
+  const { session } = setup();
+  assert.equal(surrenderTicTacToe(session, MEMBER).kind, 'forfeit');
+  assert.equal(surrenderTicTacToe(session, OTHER), null);
+  assert.equal(processMove(session, 5, OTHER), null);
+});
+
+// ── exit ────────────────────────────────────────────────────────────────────
+
+test('the initiator can exit an open game and it is cancelled', () => {
+  const { games, session } = setup({ opponentJid: null });
+  const outcome = exitTicTacToe(session, MEMBER);
+  assert.equal(outcome.kind, 'cancel');
+  assert.match(outcome.text, /CANCELLED/);
+  assert.equal(games.hasSession(GROUP), false);
+});
+
+test('the initiator exiting after a join awards the opponent a forfeit win', () => {
+  const { games, session } = setup();
+  const outcome = exitTicTacToe(session, MEMBER);
+  assert.equal(outcome.kind, 'forfeit');
+  assert.match(outcome.text, /@222 wins by forfeit/);
+  assert.equal(games.hasSession(GROUP), false);
+});
+
+test('a non-initiator cannot exit and the session stays active', () => {
+  const { games, session } = setup();
+  assert.throws(
+    () => exitTicTacToe(session, OTHER),
+    (error) => error instanceof CommandError && /started this game/.test(error.message),
+  );
+  assert.equal(games.get(GROUP), session);
+  assert.equal(session.ended, false);
+});
+
+test('the command exits for the initiator and refuses everyone else', async () => {
+  const { games } = setup();
+  const denied = makeCtx(games, { args: ['exit'], argsText: 'exit', senderJid: OTHER });
+  await assert.rejects(
+    () => tictactoeCommand.execute(denied.ctx),
+    (error) => error instanceof CommandError && /started this game/.test(error.message),
+  );
+  assert.equal(games.hasSession(GROUP), true);
+
+  const exit = makeCtx(games, { args: ['exit'], argsText: 'exit' });
+  await tictactoeCommand.execute(exit.ctx);
+  assert.equal(games.hasSession(GROUP), false);
+  assert.match(exit.replies[0].text, /FORFEIT/);
+});
+
+test('plain-text exit is ignored so only the command can end that way', async () => {
+  const { games, session, socket } = setup();
+  await say(games, 'exit', { senderJid: MEMBER });
+  assert.equal(games.get(GROUP), session);
+  assert.equal(socket.sent.length, 0);
+});
+
+test('the initiator is recognised for exit through LID and phone aliases', () => {
+  const groupMeta = {
+    participants: [{ id: '5@lid', phoneNumber: '2348012345678@s.whatsapp.net' }, { id: OTHER }],
+  };
+  const { games, session } = setup({ starterJid: '5@lid', groupMeta });
+  const outcome = exitTicTacToe(session, '2348012345678@s.whatsapp.net', { groupMeta });
+  assert.equal(outcome.kind, 'forfeit');
+  assert.equal(games.hasSession(GROUP), false);
+});
+
+// ── late actions after termination ──────────────────────────────────────────
+
+test('moves, joins and chat after a forfeit are ignored', async () => {
+  const { games, session, socket } = setup();
+  await say(games, 'surrender', { senderJid: MEMBER });
+  assert.equal(games.hasSession(GROUP), false);
+  assert.equal(processMove(session, 5, OTHER), null);
+  assert.equal(joinTicTacToe(session, SPECTATOR), null);
+  assert.equal(surrenderTicTacToe(session, OTHER), null);
+  assert.equal(await say(games, '5', { senderJid: OTHER }), false);
+  assert.equal(socket.sent.length, 1);
+});
+
+test('an ended session timer never fires after surrender', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { games, socket } = setup({ turnTimeoutMs: 1000 });
+  await say(games, 'surrender', { senderJid: MEMBER });
+  assert.equal(socket.sent.length, 1);
+  t.mock.timers.tick(1000);
+  await Promise.resolve();
+  assert.equal(socket.sent.length, 1);
+  assert.equal(games.hasSession(GROUP), false);
+});
+
+test('out-of-turn and spectator chatter do not reset the inactivity deadline', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { games, socket } = setup({ turnTimeoutMs: 1000 });
+  t.mock.timers.tick(800);
+  await say(games, 'hello', { senderJid: SPECTATOR });
+  await say(games, '3', { senderJid: OTHER });
+  await say(games, '2', { senderJid: SPECTATOR });
+  t.mock.timers.tick(200);
+  await Promise.resolve();
+  assert.equal(games.hasSession(GROUP), false);
+  assert.match(socket.sent.at(-1).content.text, /TIMED OUT/);
 });

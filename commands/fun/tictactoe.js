@@ -2,10 +2,12 @@ import { CommandError } from '../../lib/helpers.js';
 import {
   describeTicTacToeStart,
   describeTicTacToeStatus,
+  exitTicTacToe,
   joinTicTacToe,
   parseMove,
   processMove,
   startTicTacToe,
+  surrenderTicTacToe,
 } from '../../lib/games/tictactoe.js';
 
 export default {
@@ -13,7 +15,7 @@ export default {
   aliases: ['ttt'],
   description: 'Play a two-player tic-tac-toe game in the chat.',
   category: 'fun',
-  usage: 'tictactoe [@player|1-9]',
+  usage: 'tictactoe [@player|1-9|join|surrender|exit]',
   permissions: ['public'],
   cooldownMs: 1000,
   async execute(ctx) {
@@ -26,12 +28,31 @@ export default {
         return;
       }
 
-      if (ctx.args[0].trim().toLowerCase() === 'join') {
+      const verb = ctx.args[0].trim().toLowerCase();
+      if (verb === 'join') {
         const outcome = joinTicTacToe(session, ctx.senderJid, { groupMeta: ctx.groupMeta });
         if (!outcome) {
           throw new CommandError('This game already has two players, or you are already the starter.');
         }
         await ctx.reply(outcome.text, { mentions: outcome.mentions });
+        return;
+      }
+
+      if (verb === 'surrender') {
+        const outcome = surrenderTicTacToe(session, ctx.senderJid, { groupMeta: ctx.groupMeta });
+        if (!outcome) {
+          throw new CommandError('Only a seated player may surrender this game.');
+        }
+        await ctx.reply(outcome.text, outcome.mentions.length ? { mentions: outcome.mentions } : {});
+        return;
+      }
+
+      if (verb === 'exit') {
+        const outcome = exitTicTacToe(session, ctx.senderJid, { groupMeta: ctx.groupMeta });
+        if (!outcome) {
+          throw new CommandError('This game cannot be exited.');
+        }
+        await ctx.reply(outcome.text, outcome.mentions.length ? { mentions: outcome.mentions } : {});
         return;
       }
 
