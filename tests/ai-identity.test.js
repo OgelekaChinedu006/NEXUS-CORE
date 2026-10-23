@@ -11,6 +11,8 @@ import {
   IDENTITY_SIGNATURES,
   formatIdentityCaption,
   quoteSignature,
+  sendImageCaption,
+  splitCaption,
 } from '../lib/ai-identity.js';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -55,6 +57,28 @@ function registry() {
   return registryPromise;
 }
 
+function jpegBuffer() {
+  return Buffer.from([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
+  ]);
+}
+
+function mockImageFetch(t, body = jpegBuffer(), status = 200) {
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    calls.push(String(url));
+    return new Response(body, {
+      status,
+      headers: { 'content-type': 'image/jpeg' },
+    });
+  });
+  return calls;
+}
+
+function captionsMatch(full, caption, rest) {
+  return full === `${caption}${rest}` || full === `${caption}\n${rest}`;
+}
+
 function context(overrides = {}) {
   const replies = [];
   const contents = [];
@@ -81,6 +105,12 @@ function context(overrides = {}) {
       contents.push({ content, options });
       return { ok: true };
     },
+    abort() {
+      this.aborted = true;
+    },
+    isAborted() {
+      return Boolean(this.aborted);
+    },
     ...overrides,
   };
   return { ctx, replies, contents };
@@ -97,6 +127,11 @@ test('registry discovers all six AI identity commands', async () => {
     assert.equal(typeof command.execute, 'function');
     assert.deepEqual(command.permissions, ['public']);
     assert.match(command.source, new RegExp(`commands[\\\\/]ai[\\\\/]${name}\\.js$`));
+    if (name === 'isis') {
+      assert.equal(command.timeoutMs, 120000);
+    } else {
+      assert.equal(command.timeoutMs, undefined);
+    }
   }
 });
 
@@ -248,30 +283,74 @@ test('text identity commands pass the prompt and send image plus quoted signatur
   }
 });
 
-test('oversized identity answers are preserved as follow-up text', async () => {
+test('splitCaption keeps a fitting caption whole and splits overflow without loss', () => {
+  assert.deepEqual(splitCaption('short'), { caption: 'short', rest: '' });
+
+  const exact = 'x'.repeat(CAPTION_LIMIT);
+  assert.deepEqual(splitCaption(exact), { caption: exact, rest: '' });
+
+  const lined = `${'a'.repeat(40)}\n${'b'.repeat(40)}\n${'c'.repeat(40)}`;
+  const splitLined = splitCaption(lined, 90);
+  assert.ok(splitLined.caption.length <= 90);
+  assert.ok(splitLined.rest);
+  assert.equal(captionsMatch(lined, splitLined.caption, splitLined.rest), true);
+  assert.equal(splitLined.caption.endsWith('\n'), false);
+
+  const overflow = `head\n${'A'.repeat(CAPTION_LIMIT)}\ntail`;
+  const split = splitCaption(overflow);
+  assert.ok(split.caption.length <= CAPTION_LIMIT);
+  assert.ok(split.rest);
+  assert.equal(captionsMatch(overflow, split.caption, split.rest), true);
+  assert.equal(`${split.caption}\n${split.rest}`.includes('tail\ntail'), false);
+});
+
+test('oversized identity answers keep the first portion on the image', async () => {
   const loaded = await registry();
-  const answer = 'A'.repeat(CAPTION_LIMIT);
-  const { ctx, replies, contents } = context({
-    args: ['long'],
-    argsText: 'long',
-    services: {
-      ai: {
-        async chat() {
-          return answer;
+  const answer = ['Opening line.', 'A'.repeat(CAPTION_LIMIT), 'Closing line.'].join('\n');
+
+  for (const identity of TEXT_IDENTITIES) {
+    const { ctx, replies, contents } = context({
+      args: ['long'],
+      argsText: 'long',
+      services: {
+        [identity.serviceKey]: {
+          async chat() {
+            return answer;
+          },
         },
       },
-    },
+    });
+
+    await loaded.get(identity.name).execute(ctx);
+
+    const full = formatIdentityCaption(answer, IDENTITY_SIGNATURES[identity.name]);
+    const expected = splitCaption(full);
+    assert.equal(contents.length, 1);
+    assert.equal(contents[0].content.image.url, IDENTITY_ASSETS[identity.name]);
+    assert.equal(contents[0].content.caption, expected.caption);
+    assert.ok(contents[0].content.caption.length <= CAPTION_LIMIT);
+    assert.equal(replies.length, 1);
+    assert.equal(replies[0].text, expected.rest);
+    assert.equal(captionsMatch(full, expected.caption, expected.rest), true);
+    assert.ok(full.includes(answer));
+    assert.ok(full.includes(quoteSignature(IDENTITY_SIGNATURES[identity.name])));
+    assert.equal(full.split(answer).length - 1, 1);
+  }
+});
+
+test('aborted identity delivery does not send a late image or follow-up', async () => {
+  let aborted = true;
+  const { ctx, replies, contents } = context({
+    isAborted: () => aborted,
   });
 
-  await loaded.get('akasha').execute(ctx);
+  await sendImageCaption(ctx, {
+    image: IDENTITY_ASSETS.akasha,
+    caption: formatIdentityCaption('late success', IDENTITY_SIGNATURES.akasha),
+  });
 
-  assert.equal(contents.length, 1);
-  assert.equal(contents[0].content.image.url, IDENTITY_ASSETS.akasha);
-  assert.equal(contents[0].content.caption, undefined);
-  assert.equal(replies.length, 1);
-  assert.equal(replies[0].text, formatIdentityCaption(answer, IDENTITY_SIGNATURES.akasha));
-  assert.ok(replies[0].text.includes(answer));
-  assert.ok(replies[0].text.includes(quoteSignature(IDENTITY_SIGNATURES.akasha)));
+  assert.equal(contents.length, 0);
+  assert.equal(replies.length, 0);
 });
 
 test('service failures are rethrown without appending a signature', async () => {
@@ -356,9 +435,11 @@ test('isis empty prompt presents the identity image and usage', async () => {
   assert.match(contents[0].content.caption, /USAGE: !isis search <query>/);
 });
 
-test('isis generate preserves generated media with the divine artist signature', async () => {
+test('isis generate preserves generated media with the divine artist signature', async (t) => {
   const loaded = await registry();
   const generated = 'https://cdn.example.test/generated.png';
+  const image = jpegBuffer();
+  const fetchCalls = mockImageFetch(t, image);
   const calls = [];
   const { ctx, contents, replies } = context({
     args: ['a', 'crimson', 'shrine'],
@@ -379,19 +460,23 @@ test('isis generate preserves generated media with the divine artist signature',
   await loaded.get('isis').execute(ctx);
 
   assert.deepEqual(calls, [{ prompt: 'a crimson shrine' }]);
+  assert.deepEqual(fetchCalls, [generated]);
   assert.equal(replies.length, 0);
   assert.equal(contents.length, 1);
-  assert.equal(contents[0].content.image.url, generated);
-  assert.notEqual(contents[0].content.image.url, IDENTITY_ASSETS.isis);
+  assert.equal(Buffer.isBuffer(contents[0].content.image), true);
+  assert.deepEqual(contents[0].content.image, image);
+  assert.equal(contents[0].content.image.url, undefined);
   const quoted = quoteSignature(IDENTITY_SIGNATURES.isis);
   assert.equal(contents[0].content.caption, quoted);
   assert.ok(quoted.startsWith('> 𓆃 THE DIVINE ARTIST 𓆃'));
   assert.ok(quoted.includes('\n> Imagination is the seed. Creation is the revelation.'));
 });
 
-test('isis search preserves the first photo, attribution, and signature', async () => {
+test('isis search preserves the first photo, attribution, and signature', async (t) => {
   const loaded = await registry();
   const photoUrl = 'https://images.unsplash.com/photo-test';
+  const image = jpegBuffer();
+  const fetchCalls = mockImageFetch(t, image);
   const calls = [];
   const { ctx, contents } = context({
     args: ['search', 'temple', 'columns'],
@@ -420,9 +505,11 @@ test('isis search preserves the first photo, attribution, and signature', async 
   await loaded.get('isis').execute(ctx);
 
   assert.deepEqual(calls, [{ query: 'temple columns' }]);
+  assert.deepEqual(fetchCalls, [photoUrl]);
   assert.equal(contents.length, 1);
-  assert.equal(contents[0].content.image.url, photoUrl);
-  assert.notEqual(contents[0].content.image.url, IDENTITY_ASSETS.isis);
+  assert.equal(Buffer.isBuffer(contents[0].content.image), true);
+  assert.deepEqual(contents[0].content.image, image);
+  assert.equal(contents[0].content.image.url, undefined);
   const caption = contents[0].content.caption;
   assert.match(caption, /Test Photographer/);
   assert.match(caption, /https:\/\/unsplash.com\/photos\/test/);
@@ -548,4 +635,75 @@ test('isis missing generated or searched images use the identity fallback', asyn
   });
   await loaded.get('isis').execute(missingPhotoUrl.ctx);
   assertIsisFallback(missingPhotoUrl.contents, missingPhotoUrl.replies, /found no photos/i);
+});
+
+test('isis failed downloads and invalid image bytes use the identity fallback', async (t) => {
+  const loaded = await registry();
+  const generated = 'https://cdn.example.test/generated.png';
+
+  t.mock.method(globalThis, 'fetch', async () => new Response('down', { status: 503 }));
+  const failedDownload = context({
+    args: ['storm'],
+    argsText: 'storm',
+    services: {
+      isis: {
+        async generate() {
+          return { imageUrl: generated };
+        },
+      },
+    },
+  });
+  await loaded.get('isis').execute(failedDownload.ctx);
+  assertIsisFallback(failedDownload.contents, failedDownload.replies, /could not retrieve the image/i);
+
+  t.mock.reset();
+  t.mock.method(globalThis, 'fetch', async () =>
+    new Response('not-an-image', {
+      status: 200,
+      headers: { 'content-type': 'text/plain' },
+    }),
+  );
+  const invalidImage = context({
+    args: ['storm'],
+    argsText: 'storm',
+    services: {
+      isis: {
+        async generate() {
+          return { imageUrl: generated };
+        },
+      },
+    },
+  });
+  await loaded.get('isis').execute(invalidImage.ctx);
+  assertIsisFallback(invalidImage.contents, invalidImage.replies, /invalid image/i);
+});
+
+test('isis does not send a late generated image after abort', async (t) => {
+  const loaded = await registry();
+  let resolveGenerate;
+  const generateStarted = new Promise((resolve) => {
+    resolveGenerate = resolve;
+  });
+  mockImageFetch(t);
+  const { ctx, contents, replies } = context({
+    args: ['storm'],
+    argsText: 'storm',
+    services: {
+      isis: {
+        async generate() {
+          resolveGenerate();
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          return { imageUrl: 'https://cdn.example.test/generated.png' };
+        },
+      },
+    },
+  });
+
+  const execution = loaded.get('isis').execute(ctx);
+  await generateStarted;
+  ctx.abort();
+  await execution;
+
+  assert.equal(contents.length, 0);
+  assert.equal(replies.length, 0);
 });

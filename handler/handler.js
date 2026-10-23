@@ -389,11 +389,16 @@ class MessageHandler {
     });
 
     const startedAt = Date.now();
+    const executionTimeoutMs =
+      Number.isFinite(Number(command.timeoutMs)) && Number(command.timeoutMs) > 0
+        ? Number(command.timeoutMs)
+        : this.config.executionTimeoutMs;
     try {
       await withTimeout(
         Promise.resolve().then(() => command.execute(ctx)),
-        this.config.executionTimeoutMs,
+        executionTimeoutMs,
         `The curse ${command.name} exceeded its execution limit.`,
+        () => ctx.abort?.(),
       );
       this.db.recordActivity(senderJid, { groupJid: isGroup ? chatJid : null, isCommand: true });
       this.logger.debug(`Executed ${command.name} in ${Date.now() - startedAt}ms (${isGroup ? 'group' : 'direct'})`);
@@ -429,6 +434,7 @@ class MessageHandler {
     command,
   }) {
     const contextInfo = getContextInfo(msg.message);
+    let aborted = false;
     return {
       sock: socket,
       message: msg,
@@ -464,9 +470,18 @@ class MessageHandler {
             text: contextInfo.quotedMessage ? getMessageText(contextInfo.quotedMessage) : '',
           }
         : null,
-      reply: (text, options = {}) => this.safeReply(socket, chatJid, msg, text, options),
-      replyContent: (content, options = {}) =>
-        socket.sendMessage(chatJid, content, { quoted: msg, ...options }),
+      abort: () => {
+        aborted = true;
+      },
+      isAborted: () => aborted,
+      reply: (text, options = {}) => {
+        if (aborted) return Promise.resolve(null);
+        return this.safeReply(socket, chatJid, msg, text, options);
+      },
+      replyContent: (content, options = {}) => {
+        if (aborted) return Promise.resolve(null);
+        return socket.sendMessage(chatJid, content, { quoted: msg, ...options });
+      },
       refreshGroupMeta: () => this.getGroupMetadata(socket, chatJid, { force: true }),
     };
   }

@@ -257,6 +257,68 @@ test('execution timeout prevents a stalled command from hanging the handler', as
   assert.match(socket.sent[0].content.text, /execution limit/);
 });
 
+test('a timed-out command cannot send a later success after the timeout reply', async (t) => {
+  let finish;
+  const started = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const command = makeCommand({
+    name: 'isis',
+    async execute(ctx) {
+      finish();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      await ctx.replyContent({ image: { url: 'https://cdn.example.test/late.png' }, caption: 'late success' });
+      await ctx.reply('late success');
+    },
+  });
+  const { socket, handler } = createHarness(t, {
+    commands: [command],
+    config: { executionTimeoutMs: 10 },
+  });
+  const processed = handler.processMessage(socket, makeMessage({ text: '!isis storm' }));
+  await started;
+  await processed;
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  assert.equal(socket.sent.length, 1);
+  assert.match(socket.sent[0].content.text, /execution limit/);
+  assert.equal(socket.sent[0].content.image, undefined);
+});
+
+test('a command timeoutMs override is used without changing the default timeout', async (t) => {
+  let slowRan = false;
+  const slow = makeCommand({
+    name: 'isis',
+    timeoutMs: 80,
+    async execute() {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      slowRan = true;
+    },
+  });
+  const { socket, handler } = createHarness(t, {
+    commands: [slow],
+    config: { executionTimeoutMs: 10 },
+  });
+  await handler.processMessage(socket, makeMessage({ text: '!isis storm' }));
+  assert.equal(slowRan, true);
+  assert.equal(socket.sent.length, 0);
+
+  let fastFailed = false;
+  const fast = makeCommand({
+    async execute() {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      fastFailed = true;
+    },
+  });
+  const second = createHarness(t, {
+    commands: [fast],
+    config: { executionTimeoutMs: 10 },
+  });
+  await second.handler.processMessage(second.socket, makeMessage({ text: '!echo hello' }));
+  assert.equal(fastFailed, false);
+  assert.match(second.socket.sent[0].content.text, /execution limit/);
+});
+
 test('anti-link deletes the offending message and records a warning', async (t) => {
   const { db, socket, handler } = createHarness(t);
   db.ensureGroup(GROUP, 'Test Domain');

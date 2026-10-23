@@ -1,4 +1,5 @@
 import { CommandError } from '../../lib/helpers.js';
+import { fetchBuffer } from '../../lib/http.js';
 import {
   IDENTITY_ASSETS,
   IDENTITY_SIGNATURES,
@@ -31,6 +32,40 @@ function searchBody(photo) {
   return lines.join('\n');
 }
 
+function isImageBuffer(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return false;
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return true;
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) return true;
+  if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) return true;
+  return (
+    buffer[0] === 0x52 &&
+    buffer[1] === 0x49 &&
+    buffer[2] === 0x46 &&
+    buffer[3] === 0x46 &&
+    buffer[8] === 0x57 &&
+    buffer[9] === 0x45 &&
+    buffer[10] === 0x42 &&
+    buffer[11] === 0x50
+  );
+}
+
+async function sendRemoteImage(ctx, imageUrl, caption) {
+  if (ctx.isAborted?.()) return;
+  const timeoutMs = Number(ctx.config?.media?.timeoutMs);
+  let buffer;
+  try {
+    buffer = await fetchBuffer(imageUrl, {
+      timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15000,
+    });
+  } catch {
+    throw new CommandError('Isis could not retrieve the image.');
+  }
+  if (!isImageBuffer(buffer)) {
+    throw new CommandError('Isis returned an invalid image.');
+  }
+  await sendImageCaption(ctx, { image: buffer, caption });
+}
+
 async function replyIsisFailure(ctx, error) {
   await sendImageCaption(ctx, {
     image: IDENTITY_ASSETS.isis,
@@ -46,6 +81,7 @@ export default {
   usage: 'isis <prompt|search <query>>',
   permissions: ['public'],
   cooldownMs: 10000,
+  timeoutMs: 120000,
   async execute(ctx) {
     const argsText = String(ctx.argsText ?? '').trim();
     if (!argsText) {
@@ -73,11 +109,7 @@ export default {
         }
 
         const caption = isisCaption(searchBody(photo));
-        await sendImageCaption(ctx, {
-          image: photo.imageUrl,
-          caption,
-          fallbackText: [photo.imageUrl, caption].filter(Boolean).join('\n'),
-        });
+        await sendRemoteImage(ctx, photo.imageUrl, caption);
         return;
       }
 
@@ -91,12 +123,9 @@ export default {
       }
 
       const caption = isisCaption();
-      await sendImageCaption(ctx, {
-        image: result.imageUrl,
-        caption,
-        fallbackText: [result.imageUrl, caption].filter(Boolean).join('\n'),
-      });
+      await sendRemoteImage(ctx, result.imageUrl, caption);
     } catch (error) {
+      if (ctx.isAborted?.()) return;
       if (!(error instanceof CommandError)) throw error;
       await replyIsisFailure(ctx, error);
     }
