@@ -113,7 +113,13 @@ test('arise renders a menu whose advertised count matches the registry', async (
   assert.match(replies[0].text, new RegExp(`COMMANDS: ${loaded.size}`));
   assert.match(replies[0].text, /SHRINE OF THE KING/);
   assert.match(replies[0].text, /!beg <command>/);
-  assert.match(replies[0].text, /┣━━〔 ✦ SHRINE 〕\n┃\n┃ ⌁ !arise/);
+  assert.match(replies[0].text, /^╭━━『 TEST CORE 』━━╮/);
+  assert.match(replies[0].text, /┣━━〔 ✦ SHRINE 〕\n┃ ⌁ !arise/);
+  assert.doesNotMatch(replies[0].text, /┃\n┣━━〔 ✦/);
+  assert.doesNotMatch(replies[0].text, /〕\n┃\n┃ ⌁/);
+  for (const command of loaded.all()) {
+    assert.match(replies[0].text, new RegExp(`┃ ⌁ ${ctx.prefix}${command.name}$`, 'm'), `missing ${command.name}`);
+  }
 });
 
 test('arise image captions keep one command per line under the 1024 limit', async () => {
@@ -131,8 +137,11 @@ test('arise image captions keep one command per line under the 1024 limit', asyn
   const caption = contents[0].caption;
   assert.ok(caption.length <= 1024);
   assert.match(caption, new RegExp(`COMMANDS: ${loaded.size}`));
-  assert.match(caption, /┣━━〔 ✦ SHRINE 〕\n┃\n!arise\n!beg/);
-  assert.match(caption, /!vessel\n┃\n┣━━〔 ✦ DOMAIN CONTROL 〕/);
+  assert.match(caption, /^╭━━『 TEST CORE 』━━╮/);
+  assert.match(caption, /┣━━〔 ✦ SHRINE 〕\n!arise\n!beg/);
+  assert.match(caption, /!vessel\n┣━━〔 ✦ DOMAIN CONTROL 〕/);
+  assert.doesNotMatch(caption, /┃\n┣━━〔 ✦/);
+  assert.doesNotMatch(caption, /〕\n┃\n!/);
   assert.doesNotMatch(caption, /!arise, !beg/);
   const listed = new Set(caption.split('\n').filter((line) => line.startsWith(ctx.prefix)));
   for (const command of loaded.all()) {

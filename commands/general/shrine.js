@@ -61,7 +61,7 @@ function buildCaption(params) {
 
   const { prefix, version, categories, total, botName, slogan } = params;
   const header = [
-    `╭━━━〔 ${String(botName).toUpperCase()} 〕━━━╮`,
+    `╭━━『 ${String(botName).toUpperCase()} 』━━╮`,
     `┃ PREFIX: ${prefix} • COMMANDS: ${total} • VERSION: ${version}`,
   ];
   const footer = '╰━━━━━━━━━━━━━━━━━━━━╯';
@@ -77,10 +77,8 @@ function buildCaption(params) {
   if (withoutSlogan.length <= CAPTION_LIMIT) return withoutSlogan;
 
   const listedSections = [];
-  for (let i = 0; i < categories.length; i++) {
-    const category = categories[i];
-    if (i > 0) listedSections.push('┃');
-    listedSections.push(`┣━━〔 ✦ ${category.label.toUpperCase()} 〕`, '┃');
+  for (const category of categories) {
+    listedSections.push(`┣━━〔 ✦ ${category.label.toUpperCase()} 〕`);
     for (const command of category.commands) {
       listedSections.push(`${prefix}${command.name}`);
     }
@@ -89,9 +87,7 @@ function buildCaption(params) {
   if (listed.length <= CAPTION_LIMIT) return listed;
 
   const compactSections = [];
-  for (let i = 0; i < categories.length; i++) {
-    const category = categories[i];
-    if (i > 0) compactSections.push('┃');
+  for (const category of categories) {
     compactSections.push(
       `┣━━〔 ✦ ${category.label.toUpperCase()} 〕`,
       category.commands.map((command) => `${prefix}${command.name}`).join(', '),

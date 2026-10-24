@@ -54,8 +54,9 @@ test('menu advertises only supplied categories and the real total', () => {
   assert.match(output, /◈ PREFIX: !/);
   assert.match(output, /◈ VERSION: 1\.0\.0/);
   assert.match(output, /◈ COMMANDS: 3/);
-  assert.match(output, /┣━━〔 ✦ SHRINE 〕/);
-  assert.match(output, /┃ ⌁ !shrine\n┃ ⌁ !beg\n/);
+  assert.match(output, /┣━━〔 ✦ SHRINE 〕\n┃ ⌁ !shrine\n┃ ⌁ !beg\n/);
+  assert.doesNotMatch(output, /┃\n┣━━〔 ✦/);
+  assert.doesNotMatch(output, /〕\n┃\n┃ ⌁/);
   assert.match(output, /┃ ✦ Rule\./);
   assert.match(output, /!beg <command>/);
   assert.match(output, /╰━━━━━━━━━━━━━━━━━━━━╯/);
@@ -63,6 +64,41 @@ test('menu advertises only supplied categories and the real total', () => {
   assert.doesNotMatch(output, /details/);
   assert.doesNotMatch(output, /DOMAIN CONTROL/);
   assert.ok(output.endsWith(FOOTER));
+});
+
+test('menu follows each category heading with commands and no spacer lines', () => {
+  const output = menu({
+    prefix: '!',
+    version: '1.0.0',
+    total: 5,
+    botName: 'TEST CORE',
+    footer: FOOTER,
+    categories: [
+      {
+        id: 'general',
+        label: 'SHRINE',
+        commands: [
+          { name: 'arise', description: 'menu' },
+          { name: 'beg', description: 'details' },
+        ],
+      },
+      {
+        id: 'admin',
+        label: 'DOMAIN CONTROL',
+        commands: [
+          { name: 'ascend', description: 'promote' },
+          { name: 'territory', description: 'group' },
+          { name: 'vessel', description: 'bot' },
+        ],
+      },
+    ],
+  });
+  assert.match(
+    output,
+    /┣━━〔 ✦ SHRINE 〕\n┃ ⌁ !arise\n┃ ⌁ !beg\n┣━━〔 ✦ DOMAIN CONTROL 〕\n┃ ⌁ !ascend\n┃ ⌁ !territory\n┃ ⌁ !vessel\n/,
+  );
+  assert.doesNotMatch(output, /┃\n┣━━〔 ✦/);
+  assert.doesNotMatch(output, /〕\n┃\n┃ ⌁/);
 });
 
 test('renderTemplate replaces every known token and leaves unknown tokens alone', () => {
