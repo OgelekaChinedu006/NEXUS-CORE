@@ -102,7 +102,7 @@ All configuration is read from environment variables. Defaults are defined in `c
 | `SPAM_WINDOW_MS` | `6000` | Anti-flood window. |
 | `SPAM_THRESHOLD` | `7` | Messages that trigger anti-flood. |
 | `SECURITY_ACTION_COOLDOWN_MS` | `30000` | Cooldown between security actions. |
-| `MAX_MENTIONS` | `120` | Maximum mentions in a single summon or tag. |
+| `MAX_MENTIONS` | `500` | Maximum eligible participants for one `summon` or `converge` operation. Larger groups are refused. Payload-limit failures split into smaller batches. |
 | `PROFANITY_WORDS` | built-in list | Comma-separated additional profanity words. |
 | `DEFAULT_WELCOME_TEXT` | built-in template | Override the default welcome template. |
 | `DEFAULT_GOODBYE_TEXT` | built-in template | Override the default departure template. |

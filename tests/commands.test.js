@@ -36,7 +36,7 @@ function baseConfig(overrides = {}) {
     locale: 'en-GB',
     timezone: 'UTC',
     shrine: { slogan: 'The King does not ask.' },
-    security: { maxMentions: 120 },
+    security: { maxMentions: 500 },
     ...overrides,
   };
 }
@@ -519,6 +519,24 @@ test('converge refuses oversized groups instead of omitting members', async () =
     config: baseConfig({ security: { maxMentions: 3 } }),
   });
   await loaded.get('converge').execute(ctx);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].text, /DOMAIN TOO VAST/);
+  assert.match(replies[0].text, /SOULS: 5/);
+  assert.match(replies[0].text, /SAFE LIMIT: 3/);
+  assert.equal(replies[0].options.mentions, undefined);
+});
+
+test('summon refuses oversized groups instead of omitting members', async () => {
+  const loaded = await registry();
+  const participants = Array.from({ length: 5 }, (_, index) => ({
+    id: `user${index}@s.whatsapp.net`,
+  }));
+  participants.push({ id: 'bot@s.whatsapp.net', admin: 'admin' });
+  const { ctx, replies } = context({
+    groupMeta: { participants },
+    config: baseConfig({ security: { maxMentions: 3 } }),
+  });
+  await loaded.get('summon').execute(ctx);
   assert.equal(replies.length, 1);
   assert.match(replies[0].text, /DOMAIN TOO VAST/);
   assert.match(replies[0].text, /SOULS: 5/);

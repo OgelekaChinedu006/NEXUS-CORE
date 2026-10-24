@@ -1,5 +1,10 @@
 import { fullFrame } from '../../lib/formatter.js';
-import { displayMention, normalizeJid } from '../../lib/helpers.js';
+import { displayMention } from '../../lib/helpers.js';
+import {
+  broadcastMentions,
+  listEligibleParticipants,
+  resolveMaxMentions,
+} from '../../lib/mention-broadcast.js';
 
 export default {
   name: 'converge',
@@ -20,16 +25,14 @@ export default {
       return;
     }
 
-    const participants = (ctx.groupMeta.participants || [])
-      .map((participant) => normalizeJid(participant.id))
-      .filter((jid) => jid && jid !== ctx.botJid);
+    const participants = listEligibleParticipants(ctx.groupMeta, ctx.botJid);
 
     if (!participants.length) {
       await ctx.reply(fullFrame('☠️ EMPTY DOMAIN', ['No souls answered the register.']));
       return;
     }
 
-    const maxMentions = Number(ctx.config?.security?.maxMentions) || 0;
+    const maxMentions = resolveMaxMentions(ctx.config);
     if (maxMentions > 0 && participants.length > maxMentions) {
       await ctx.reply(
         fullFrame('☠️ DOMAIN TOO VAST', [
@@ -41,13 +44,37 @@ export default {
       return;
     }
 
-    const lines = [
-      '🌀 THE DOMAIN CONVERGES.',
-      ctx.argsText ? `🩸 WORD: ${ctx.argsText.slice(0, 300)}` : '🩸 Every soul is named. None are spared.',
-      '',
-      ...participants.map((jid) => displayMention(jid)),
-    ];
+    const announcement = ctx.argsText
+      ? `🩸 WORD: ${ctx.argsText.slice(0, 300)}`
+      : '🩸 Every soul is named. None are spared.';
 
-    await ctx.reply(fullFrame('🌀 CONVERGE', lines, { showFooter: true }), { mentions: participants });
+    const result = await broadcastMentions(ctx, {
+      participants,
+      formatBatch(batch) {
+        return {
+          text: fullFrame(
+            '🌀 CONVERGE',
+            [
+              '🌀 THE DOMAIN CONVERGES.',
+              announcement,
+              '',
+              ...batch.map((jid) => displayMention(jid)),
+            ],
+            { showFooter: true },
+          ),
+          mentions: batch,
+        };
+      },
+    });
+
+    if (result.failed > 0) {
+      await ctx.reply(
+        fullFrame('☠️ INCOMPLETE CONVERGE', [
+          `🩸 NAMED: ${result.sent}`,
+          `⛓ UNREACHED: ${result.failed}`,
+          'The remaining souls were not mentioned.',
+        ]),
+      );
+    }
   },
 };

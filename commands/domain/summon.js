@@ -1,5 +1,9 @@
 import { fullFrame } from '../../lib/formatter.js';
-import { normalizeJid } from '../../lib/helpers.js';
+import {
+  broadcastMentions,
+  listEligibleParticipants,
+  resolveMaxMentions,
+} from '../../lib/mention-broadcast.js';
 
 export default {
   name: 'summon',
@@ -10,27 +14,57 @@ export default {
   permissions: ['admin'],
   cooldownMs: 10000,
   async execute(ctx) {
-    const participants = (ctx.groupMeta?.participants || [])
-      .map((participant) => normalizeJid(participant.id))
-      .filter((jid) => jid && jid !== ctx.botJid);
+    const participants = listEligibleParticipants(ctx.groupMeta, ctx.botJid);
 
     if (!participants.length) {
       await ctx.reply(fullFrame('☠️ EMPTY DOMAIN', ['No souls answered the register.']));
       return;
     }
 
-    const limited = participants.slice(0, ctx.config.security.maxMentions);
-    const lines = [
-      '👹 THE KING SUMMONS YOU.',
-      ctx.argsText ? `🩸 WORD: ${ctx.argsText.slice(0, 300)}` : '🩸 No words were given. Presence is demanded.',
-      '',
-      ...chunkMentions(limited),
-    ];
-    if (participants.length > limited.length) {
-      lines.push('', `⚠️ ${participants.length - limited.length} soul(s) exceeded the summoning limit.`);
+    const maxMentions = resolveMaxMentions(ctx.config);
+    if (maxMentions > 0 && participants.length > maxMentions) {
+      await ctx.reply(
+        fullFrame('☠️ DOMAIN TOO VAST', [
+          `🩸 SOULS: ${participants.length}`,
+          `⛓ SAFE LIMIT: ${maxMentions}`,
+          'The summoning would break. No souls were named.',
+        ]),
+      );
+      return;
     }
 
-    await ctx.reply(fullFrame('📣 SUMMONING', lines, { showFooter: true }), { mentions: limited });
+    const announcement = ctx.argsText
+      ? `🩸 WORD: ${ctx.argsText.slice(0, 300)}`
+      : '🩸 No words were given. Presence is demanded.';
+
+    const result = await broadcastMentions(ctx, {
+      participants,
+      formatBatch(batch) {
+        return {
+          text: fullFrame(
+            '📣 SUMMONING',
+            [
+              '👹 THE KING SUMMONS YOU.',
+              announcement,
+              '',
+              ...chunkMentions(batch),
+            ],
+            { showFooter: true },
+          ),
+          mentions: batch,
+        };
+      },
+    });
+
+    if (result.failed > 0) {
+      await ctx.reply(
+        fullFrame('☠️ INCOMPLETE SUMMONING', [
+          `🩸 NAMED: ${result.sent}`,
+          `⛓ UNREACHED: ${result.failed}`,
+          'The remaining souls were not mentioned.',
+        ]),
+      );
+    }
   },
 };
 

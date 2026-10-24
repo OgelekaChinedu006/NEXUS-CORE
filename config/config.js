@@ -388,7 +388,7 @@ export function createConfig(env = process.env) {
         .filter(Boolean)
         .concat(DEFAULT_PROFANITY_WORDS),
       actionCooldownMs: int(env.SECURITY_ACTION_COOLDOWN_MS, 30000, { min: 5000, max: 300000 }),
-      maxMentions: int(env.MAX_MENTIONS, 120, { min: 10, max: 500 }),
+      maxMentions: int(env.MAX_MENTIONS, 500, { min: 10, max: 500 }),
     }),
     welcome: Object.freeze({
       defaultText: env.DEFAULT_WELCOME_TEXT || DEFAULT_WELCOME_TEMPLATE,
