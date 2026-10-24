@@ -16,7 +16,7 @@ const PRIORITY_COMMANDS = [
   'condemn', 'pardon', 'domainlink',
   'malevolent', 'profanity', 'overwhelm', 'vigil', 'judgment', 'welcome', 'departure',
   'farewell', 'law', 'doctrine',
-  'regime', 'edictor', 'reawaken', 'alliance', 'absence',
+  'regime', 'edictor', 'bind', 'unbind', 'mode', 'reawaken', 'alliance', 'absence',
 ];
 
 let registryPromise;
@@ -194,19 +194,79 @@ test('regime changes and resets the global prefix while rejecting invalid prefix
   await assert.rejects(() => command.execute(ctx), CommandError);
 });
 
-test('edictor adds, lists and removes operators without blessing the owner or bot', async (t) => {
+test('bind and unbind manage sudo users without blessing the owner or bot', async (t) => {
+  const db = new NexusDatabase(':memory:');
+  t.after(() => db.close());
+  const loaded = await registry();
+  const bind = loaded.get('bind');
+  const unbind = loaded.get('unbind');
+  const { ctx, replies } = context({ db, isOwner: true, commandName: 'bind', command: bind });
+
+  ctx.args = [];
+  ctx.targetJid = 'member@s.whatsapp.net';
+  await bind.execute(ctx);
+  assert.equal(db.isOperator('member@s.whatsapp.net'), true);
+  assert.match(replies.at(-1).text, /USER BOUND/);
+
+  ctx.args = ['list'];
+  ctx.targetJid = null;
+  await bind.execute(ctx);
+  assert.match(replies.at(-1).text, /BOUND USERS/);
+  assert.match(replies.at(-1).text, /@member/);
+
+  ctx.commandName = 'unbind';
+  ctx.command = unbind;
+  ctx.args = [];
+  ctx.targetJid = 'member@s.whatsapp.net';
+  await unbind.execute(ctx);
+  assert.equal(db.isOperator('member@s.whatsapp.net'), false);
+  assert.match(replies.at(-1).text, /USER UNBOUND/);
+
+  ctx.commandName = 'bind';
+  ctx.command = bind;
+  ctx.args = [];
+  ctx.targetJid = 'owner@s.whatsapp.net';
+  await assert.rejects(() => bind.execute(ctx), /Sovereign/);
+
+  ctx.targetJid = 'bot@s.whatsapp.net';
+  await assert.rejects(() => bind.execute(ctx), /vessel cannot be bound/);
+
+  ctx.args = [];
+  ctx.targetJid = null;
+  await assert.rejects(() => bind.execute(ctx), /bind @user/);
+
+  ctx.commandName = 'unbind';
+  ctx.command = unbind;
+  await assert.rejects(() => unbind.execute(ctx), /unbind @user/);
+
+  ctx.commandName = 'bind';
+  ctx.command = bind;
+  ctx.args = ['list'];
+  ctx.targetJid = 'member@s.whatsapp.net';
+  await bind.execute(ctx);
+  assert.match(replies.at(-1).text, /BOUND USERS/);
+});
+
+test('legacy sudo and edictor aliases stay compatible and owner-protected', async (t) => {
   const db = new NexusDatabase(':memory:');
   t.after(() => db.close());
   const loaded = await registry();
   const command = loaded.get('edictor');
-  const { ctx, replies } = context({ db, isOwner: true });
+  assert.equal(loaded.get('sudo'), command);
+  assert.equal(loaded.get('operators'), command);
+  assert.equal(loaded.get('bind'), command);
+  assert.notEqual(loaded.get('unbind'), command);
+  assert.deepEqual(command.permissions, ['owner']);
+  assert.deepEqual(loaded.get('unbind').permissions, ['owner']);
 
+  const { ctx, replies } = context({ db, isOwner: true, commandName: 'sudo', command });
   ctx.args = ['add'];
   ctx.targetJid = 'member@s.whatsapp.net';
   await command.execute(ctx);
   assert.equal(db.isOperator('member@s.whatsapp.net'), true);
-  assert.match(replies.at(-1).text, /OPERATOR BOUND/);
+  assert.match(replies.at(-1).text, /USER BOUND/);
 
+  ctx.commandName = 'edictor';
   ctx.args = ['list'];
   ctx.targetJid = null;
   await command.execute(ctx);
@@ -216,10 +276,53 @@ test('edictor adds, lists and removes operators without blessing the owner or bo
   ctx.targetJid = 'member@s.whatsapp.net';
   await command.execute(ctx);
   assert.equal(db.isOperator('member@s.whatsapp.net'), false);
+});
 
-  ctx.args = ['add'];
-  ctx.targetJid = 'owner@s.whatsapp.net';
-  await assert.rejects(() => command.execute(ctx), /Sovereign/);
+test('arise menu shows bind and unbind but hides edictor and sudo', async () => {
+  const loaded = await registry();
+  const { ctx, replies } = context({ registry: loaded, args: ['sovereign'], argsText: 'sovereign' });
+  await loaded.get('arise').execute(ctx);
+  const text = replies[0].text;
+  assert.match(text, /!bind/);
+  assert.match(text, /!unbind/);
+  assert.match(text, /!mode/);
+  assert.doesNotMatch(text, /!edictor/);
+  assert.doesNotMatch(text, /!sudo/);
+  assert.doesNotMatch(text, /!operators/);
+});
+
+test('mode displays, validates and persists the global operating mode', async (t) => {
+  const db = new NexusDatabase(':memory:');
+  t.after(() => db.close());
+  const loaded = await registry();
+  const command = loaded.get('mode');
+  assert.deepEqual(command.permissions, ['owner']);
+  const { ctx, replies } = context({ db, isOwner: true });
+
+  ctx.args = [];
+  await command.execute(ctx);
+  assert.match(replies.at(-1).text, /CURRENT: COVENANT/);
+  assert.match(replies.at(-1).text, /Only the Sovereign and bound users are heard/);
+  assert.match(replies.at(-1).text, /The vessel answers every soul/);
+  assert.match(replies.at(-1).text, /Only the Sovereign is heard/);
+
+  ctx.args = ['veil'];
+  await command.execute(ctx);
+  assert.equal(db.getSetting('access_mode'), 'veil');
+  assert.match(replies.at(-1).text, /CURRENT: VEIL/);
+
+  ctx.args = ['not-a-mode'];
+  await command.execute(ctx);
+  assert.equal(db.getSetting('access_mode'), 'veil');
+  assert.match(replies.at(-1).text, /not a known mode/);
+
+  ctx.args = ['awaken'];
+  await command.execute(ctx);
+  assert.equal(db.getSetting('access_mode'), 'awaken');
+
+  ctx.args = ['covenant'];
+  await command.execute(ctx);
+  assert.equal(db.getSetting('access_mode'), 'covenant');
 });
 
 test('absence toggles the handler flag and rewrites the notice', async (t) => {

@@ -12,6 +12,7 @@ import {
   withTimeout,
 } from '../lib/helpers.js';
 import { isGroupAdmin, isBotAdmin, checkPermissions, describePermissions } from '../lib/permissions.js';
+import { allowsAccess, getAccessMode } from '../lib/access-mode.js';
 import { warnUser } from '../lib/moderation.js';
 import { createGameManager } from '../lib/games/manager.js';
 
@@ -231,6 +232,8 @@ class MessageHandler {
 
     const isOwner = Boolean(this.config.ownerJid && senderJid === this.config.ownerJid);
     const isSudo = this.db.isOperator(senderJid);
+
+    if (!allowsAccess(getAccessMode(this.db), { isOwner, isSudo })) return;
 
     if (!isOwner && this.db.isGloballyBanned(senderJid)) return;
 

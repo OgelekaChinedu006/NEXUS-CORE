@@ -123,6 +123,7 @@ function makeGame({ reply = null, throws = null } = {}) {
 
 function createHarness(t, { games, logger = silent } = {}) {
   const db = new NexusDatabase(':memory:');
+  db.setSetting('access_mode', 'awaken');
   const socket = makeSocket();
   const handler = createHandler({
     config: makeConfig(),
