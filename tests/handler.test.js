@@ -54,10 +54,10 @@ function makeGroupMeta(botAdmin = false) {
   };
 }
 
-function makeSocket(groupMeta = makeGroupMeta()) {
+function makeSocket(groupMeta = makeGroupMeta(), user = { id: BOT }) {
   const sent = [];
   return {
-    user: { id: BOT },
+    user,
     sent,
     ev: {
       on() {},
@@ -125,10 +125,10 @@ function makeMessage({
   };
 }
 
-function createHarness(t, { commands = [makeCommand()], config = {}, groupMeta, accessMode = 'awaken' } = {}) {
+function createHarness(t, { commands = [makeCommand()], config = {}, groupMeta, accessMode = 'awaken', user } = {}) {
   const db = new NexusDatabase(':memory:');
   if (accessMode) db.setSetting('access_mode', accessMode);
-  const socket = makeSocket(groupMeta);
+  const socket = makeSocket(groupMeta, user);
   const connection = { state: 'open', uptimeMs: 1000 };
   const handler = createHandler({
     config: makeConfig(config),
@@ -621,4 +621,80 @@ test('non-owners cannot bind, unbind or list sudo users', async (t) => {
 
   await handler.processMessage(socket, makeMessage({ id: 'B4', chat: OWNER, text: '!bind list' }));
   assert.deepEqual(bound, ['bind']);
+});
+
+test('linked-owner phone commands pass fromMe while bot outbound 3EB0 ids stay ignored', async (t) => {
+  let executed = 0;
+  const command = makeCommand({
+    async execute() {
+      executed += 1;
+    },
+  });
+  const { socket, handler } = createHarness(t, {
+    commands: [command],
+    config: { ownerJid: BOT },
+    user: { id: `${BOT.split('@')[0]}:12@s.whatsapp.net`, lid: '111111111111111@lid' },
+    accessMode: 'covenant',
+  });
+
+  await handler.processMessage(
+    socket,
+    makeMessage({ id: '3EB0DEADBEEFCAFE01', chat: MEMBER, fromMe: true, text: '!echo hello' }),
+  );
+  assert.equal(executed, 0);
+  assert.equal(socket.sent.length, 0);
+
+  await handler.processMessage(
+    socket,
+    makeMessage({ id: 'PHONEOWNER1', chat: MEMBER, fromMe: true, text: '!echo hello' }),
+  );
+  assert.equal(executed, 1);
+});
+
+test('fromMe commands from a non-owner bot session remain ignored', async (t) => {
+  let executed = 0;
+  const command = makeCommand({
+    async execute() {
+      executed += 1;
+    },
+  });
+  const { socket, handler } = createHarness(t, { commands: [command], accessMode: 'covenant' });
+
+  await handler.processMessage(
+    socket,
+    makeMessage({ id: 'PHONESTRANGER1', chat: MEMBER, fromMe: true, text: '!echo hello' }),
+  );
+  assert.equal(executed, 0);
+  assert.equal(socket.sent.length, 0);
+});
+
+test('linked owner can run owner-only commands in a group via fromMe', async (t) => {
+  let seen = null;
+  const command = makeCommand({
+    name: 'mode',
+    permissions: ['owner'],
+    async execute(ctx) {
+      seen = ctx.senderJid;
+      await ctx.reply(`mode:${ctx.argsText || 'status'}`);
+    },
+  });
+  const { socket, handler } = createHarness(t, {
+    commands: [command],
+    config: { ownerJid: BOT },
+    user: { id: BOT },
+    accessMode: 'covenant',
+  });
+
+  await handler.processMessage(
+    socket,
+    makeMessage({
+      id: 'PHONEOWNER2',
+      chat: GROUP,
+      sender: BOT,
+      fromMe: true,
+      text: '!mode veil',
+    }),
+  );
+  assert.equal(seen, BOT);
+  assert.match(socket.sent.at(-1).content.text, /mode:veil/);
 });

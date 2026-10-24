@@ -27,6 +27,25 @@ const WRAPPER_KEYS = [
 ];
 
 const URL_PATTERN = /\b(?:https?:\/\/|www\.)[^\s<>"']+/i;
+const BAILEYS_MESSAGE_ID_PREFIX = '3EB0';
+
+function isBaileysOutboundId(id) {
+  return typeof id === 'string' && id.toUpperCase().startsWith(BAILEYS_MESSAGE_ID_PREFIX);
+}
+
+function sessionIdentityJids(user) {
+  if (!user || typeof user !== 'object') return [];
+  const jids = [];
+  for (const value of [user.id, user.lid, user.jid]) {
+    const normalized = normalizeJid(value);
+    if (normalized && !jids.includes(normalized)) jids.push(normalized);
+  }
+  return jids;
+}
+
+function isLinkedOwnerSession(ownerJid, user) {
+  return Boolean(ownerJid && sessionIdentityJids(user).includes(ownerJid));
+}
 
 export function unwrapMessage(message, depth = 0) {
   if (!message || depth > 6) return message;
@@ -215,29 +234,37 @@ class MessageHandler {
   async processMessage(socket, msg) {
     const key = msg?.key;
     if (!key?.remoteJid) return;
-    if (key.fromMe) return;
 
     const chatJid = key.remoteJid;
     if (chatJid === 'status@broadcast' || chatJid.endsWith('@broadcast') || chatJid.endsWith('@newsletter')) {
       return;
     }
     if (!key.id) return;
-    if (!this.db.claimMessage(key.id, chatJid)) return;
-
-    const senderJid = normalizeJid(key.participant || (isJidGroup(chatJid) ? null : chatJid));
-    if (!senderJid) return;
 
     const botJid = normalizeJid(socket.user?.id);
-    if (botJid && senderJid === botJid) return;
+    const ownerJid = this.config.ownerJid;
+    const fromLinkedOwner = Boolean(
+      key.fromMe &&
+        isLinkedOwnerSession(ownerJid, socket.user) &&
+        !isBaileysOutboundId(key.id),
+    );
+    if (key.fromMe && !fromLinkedOwner) return;
+    if (!this.db.claimMessage(key.id, chatJid)) return;
 
-    const isOwner = Boolean(this.config.ownerJid && senderJid === this.config.ownerJid);
+    const isGroup = isJidGroup(chatJid);
+    const senderJid = fromLinkedOwner
+      ? ownerJid
+      : normalizeJid(key.participant || (isGroup ? null : chatJid));
+    if (!senderJid) return;
+    if (!fromLinkedOwner && botJid && senderJid === botJid) return;
+
+    const isOwner = Boolean(ownerJid && senderJid === ownerJid);
     const isSudo = this.db.isOperator(senderJid);
 
     if (!allowsAccess(getAccessMode(this.db), { isOwner, isSudo })) return;
 
     if (!isOwner && this.db.isGloballyBanned(senderJid)) return;
 
-    const isGroup = isJidGroup(chatJid);
     let groupMeta = null;
     if (isGroup) {
       groupMeta = await this.getGroupMetadata(socket, chatJid);
