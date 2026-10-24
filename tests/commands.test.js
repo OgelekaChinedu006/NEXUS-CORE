@@ -12,7 +12,7 @@ const logger = createLogger({ level: 'silent' });
 const PRIORITY_COMMANDS = [
   'arise', 'beg', 'pulse', 'manifest', 'eternity', 'sovereign', 'territory', 'dominion',
   'footprint', 'soulscan', 'vessel', 'oracle', 'sigil',
-  'cleave', 'silence', 'release', 'ascend', 'crush', 'dismantle', 'summon', 'shadowtag',
+  'cleave', 'silence', 'release', 'ascend', 'crush', 'dismantle', 'summon', 'shadowtag', 'converge',
   'condemn', 'pardon', 'domainlink',
   'malevolent', 'profanity', 'overwhelm', 'vigil', 'judgment', 'welcome', 'departure',
   'farewell', 'law', 'doctrine',
@@ -448,6 +448,118 @@ test('reawaken replies before scheduling a single socket restart', async () => {
   assert.match(replies[0].text, /REAWAKENING/);
   await new Promise((resolve) => setTimeout(resolve, 900));
   assert.equal(restarted, 1);
+});
+
+test('converge is a distinct group command and does not alias summon or shadowtag', async () => {
+  const loaded = await registry();
+  const command = loaded.get('converge');
+  assert.ok(command);
+  assert.equal(command.name, 'converge');
+  assert.equal(command.category, 'domain');
+  assert.deepEqual(command.aliases, []);
+  assert.deepEqual(command.permissions, ['group']);
+  assert.notEqual(command, loaded.get('summon'));
+  assert.notEqual(command, loaded.get('shadowtag'));
+  assert.notEqual(loaded.get('tagall'), command);
+  assert.notEqual(loaded.get('tagadmins'), command);
+});
+
+test('converge mentions every eligible participant once in a single message and excludes the bot', async () => {
+  const loaded = await registry();
+  const { ctx, replies } = context({
+    isAdmin: false,
+    senderJid: 'member@s.whatsapp.net',
+    argsText: 'Assemble now',
+  });
+  await loaded.get('converge').execute(ctx);
+  assert.equal(replies.length, 1);
+  const { text, options } = replies[0];
+  assert.deepEqual(options.mentions, [
+    'admin@s.whatsapp.net',
+    'member@s.whatsapp.net',
+    'creator@s.whatsapp.net',
+  ]);
+  assert.equal(options.mentions.includes('bot@s.whatsapp.net'), false);
+  assert.match(text, /@admin/);
+  assert.match(text, /@member/);
+  assert.match(text, /@creator/);
+  assert.doesNotMatch(text, /@bot\b/);
+  assert.match(text, /WORD: Assemble now/);
+  assert.match(text, /CONVERGE/);
+});
+
+test('converge rejects private chats, empty registers and unread metadata', async () => {
+  const loaded = await registry();
+  const command = loaded.get('converge');
+
+  const privateChat = context({ isGroup: false, groupMeta: null, chatJid: 'member@s.whatsapp.net' });
+  await command.execute(privateChat.ctx);
+  assert.equal(privateChat.replies.length, 1);
+  assert.match(privateChat.replies[0].text, /PRIVATE VOID/);
+  assert.equal(privateChat.replies[0].options.mentions, undefined);
+
+  const empty = context({ groupMeta: { participants: [{ id: 'bot@s.whatsapp.net', admin: 'admin' }] } });
+  await command.execute(empty.ctx);
+  assert.match(empty.replies[0].text, /EMPTY DOMAIN/);
+  assert.equal(empty.replies[0].options.mentions, undefined);
+
+  const missingMeta = context({ groupMeta: null });
+  await command.execute(missingMeta.ctx);
+  assert.match(missingMeta.replies[0].text, /DOMAIN UNREADABLE/);
+});
+
+test('converge refuses oversized groups instead of omitting members', async () => {
+  const loaded = await registry();
+  const participants = Array.from({ length: 5 }, (_, index) => ({
+    id: `user${index}@s.whatsapp.net`,
+  }));
+  participants.push({ id: 'bot@s.whatsapp.net', admin: 'admin' });
+  const { ctx, replies } = context({
+    groupMeta: { participants },
+    config: baseConfig({ security: { maxMentions: 3 } }),
+  });
+  await loaded.get('converge').execute(ctx);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].text, /DOMAIN TOO VAST/);
+  assert.match(replies[0].text, /SOULS: 5/);
+  assert.match(replies[0].text, /SAFE LIMIT: 3/);
+  assert.equal(replies[0].options.mentions, undefined);
+});
+
+test('summon and shadowtag keep their aliases, admin gate and mention behaviour', async () => {
+  const loaded = await registry();
+  const summon = loaded.get('summon');
+  const shadowtag = loaded.get('shadowtag');
+
+  assert.equal(loaded.get('tagall'), summon);
+  assert.equal(loaded.get('tagadmins'), shadowtag);
+  assert.deepEqual(summon.aliases, ['tagall']);
+  assert.deepEqual(shadowtag.aliases, ['tagadmins']);
+  assert.deepEqual(summon.permissions, ['admin']);
+  assert.deepEqual(shadowtag.permissions, ['admin']);
+  assert.equal(summon.category, 'domain');
+  assert.equal(shadowtag.category, 'domain');
+
+  const summoned = context({ argsText: 'Appear' });
+  await summon.execute(summoned.ctx);
+  assert.equal(summoned.replies.length, 1);
+  assert.deepEqual(summoned.replies[0].options.mentions, [
+    'admin@s.whatsapp.net',
+    'member@s.whatsapp.net',
+    'creator@s.whatsapp.net',
+  ]);
+  assert.match(summoned.replies[0].text, /SUMMONING/);
+  assert.match(summoned.replies[0].text, /WORD: Appear/);
+
+  const shadowed = context();
+  await shadowtag.execute(shadowed.ctx);
+  assert.equal(shadowed.replies.length, 1);
+  assert.deepEqual(shadowed.replies[0].options.mentions, [
+    'admin@s.whatsapp.net',
+    'creator@s.whatsapp.net',
+  ]);
+  assert.match(shadowed.replies[0].text, /SHADOWTAG/);
+  assert.doesNotMatch(shadowed.replies[0].text, /@member/);
 });
 
 test('command failures are exposed as typed CommandErrors', async (t) => {
