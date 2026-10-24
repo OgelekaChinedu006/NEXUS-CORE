@@ -16,6 +16,7 @@ import { allowsAccess, getAccessMode } from '../lib/access-mode.js';
 import { warnUser } from '../lib/moderation.js';
 import { createGameManager } from '../lib/games/manager.js';
 import { createHorusMonitor } from '../lib/horus.js';
+import { createStatusCache, isStatusBroadcastJid } from '../lib/status-echo.js';
 
 const WRAPPER_KEYS = [
   'ephemeralMessage',
@@ -145,6 +146,7 @@ class MessageHandler {
     this.spamBuckets = new Map();
     this.securityActions = new Map();
     this.noticeBuckets = new Map();
+    this.statusCache = createStatusCache();
     this.pruneTimer = setInterval(() => this.pruneCaches(), 60000);
     this.pruneTimer.unref?.();
   }
@@ -240,12 +242,22 @@ class MessageHandler {
     } catch (error) {
       this.logger.debug(`Horus cache prune failed: ${error.message}`);
     }
+    try {
+      this.statusCache.prune(now);
+    } catch (error) {
+      this.logger.debug(`Status cache prune failed: ${error.message}`);
+    }
   }
 
   async handleUpsert(socket, { messages, type }) {
-    if (type !== 'notify' || !Array.isArray(messages)) return;
+    if (!Array.isArray(messages)) return;
     for (const message of messages) {
       try {
+        if (isStatusBroadcastJid(message?.key?.remoteJid)) {
+          this.statusCache.observe(message);
+          continue;
+        }
+        if (type !== 'notify') continue;
         await this.processMessage(socket, message);
       } catch (error) {
         this.logger.error(`Message processing failure: ${error.message}`);
@@ -258,7 +270,11 @@ class MessageHandler {
     if (!key?.remoteJid) return;
 
     const chatJid = key.remoteJid;
-    if (chatJid === 'status@broadcast' || chatJid.endsWith('@broadcast') || chatJid.endsWith('@newsletter')) {
+    if (isStatusBroadcastJid(chatJid)) {
+      this.statusCache.observe(msg);
+      return;
+    }
+    if (chatJid.endsWith('@broadcast') || chatJid.endsWith('@newsletter')) {
       return;
     }
     if (!key.id) return;
@@ -521,10 +537,13 @@ class MessageHandler {
       isSudo,
       isAdmin,
       isBotAdmin: isBotAdmin(groupMeta, botJid),
+      statusCache: this.statusCache,
       quoted: contextInfo
         ? {
             message: contextInfo.quotedMessage || null,
             participant: normalizeJid(contextInfo.participant),
+            stanzaId: contextInfo.stanzaId || null,
+            remoteJid: normalizeJid(contextInfo.remoteJid),
             text: contextInfo.quotedMessage ? getMessageText(contextInfo.quotedMessage) : '',
           }
         : null,
