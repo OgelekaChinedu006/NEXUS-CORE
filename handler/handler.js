@@ -15,6 +15,7 @@ import { isGroupAdmin, isBotAdmin, checkPermissions, describePermissions } from 
 import { allowsAccess, getAccessMode } from '../lib/access-mode.js';
 import { warnUser } from '../lib/moderation.js';
 import { createGameManager } from '../lib/games/manager.js';
+import { createHorusMonitor } from '../lib/horus.js';
 
 const WRAPPER_KEYS = [
   'ephemeralMessage',
@@ -134,8 +135,10 @@ class MessageHandler {
     this.services = services;
     this.socket = null;
     this.games = games || createGameManager({ getSocket: () => this.socket, logger });
+    this.horus = createHorusMonitor({ db, config, logger });
     this.boundUpsert = null;
     this.boundParticipants = null;
+    this.boundUpdates = null;
     this.metadataCache = new Map();
     this.rateBuckets = new Map();
     this.cooldowns = new Map();
@@ -159,7 +162,13 @@ class MessageHandler {
         this.logger.error(`Participant event failure: ${error.message}`);
       });
     };
+    this.boundUpdates = (updates) => {
+      this.horus.handleUpdates(socket, updates).catch((error) => {
+        this.logger.error(`Horus update failure: ${error.message}`);
+      });
+    };
     socket.ev.on('messages.upsert', this.boundUpsert);
+    socket.ev.on('messages.update', this.boundUpdates);
     socket.ev.on('group-participants.update', this.boundParticipants);
   }
 
@@ -178,9 +187,17 @@ class MessageHandler {
         // Socket already disposed.
       }
     }
+    if (this.socket && this.boundUpdates) {
+      try {
+        this.socket.ev.off('messages.update', this.boundUpdates);
+      } catch {
+        // Socket already disposed.
+      }
+    }
     this.socket = null;
     this.boundUpsert = null;
     this.boundParticipants = null;
+    this.boundUpdates = null;
   }
 
   shutdown() {
@@ -217,6 +234,11 @@ class MessageHandler {
       this.db.pruneProcessedMessages(86400);
     } catch (error) {
       this.logger.debug(`Message dedupe prune failed: ${error.message}`);
+    }
+    try {
+      this.horus.prune(now);
+    } catch (error) {
+      this.logger.debug(`Horus cache prune failed: ${error.message}`);
     }
   }
 
@@ -257,6 +279,12 @@ class MessageHandler {
       : normalizeJid(key.participant || (isGroup ? null : chatJid));
     if (!senderJid) return;
     if (!fromLinkedOwner && botJid && senderJid === botJid) return;
+
+    this.horus.observeUpsert(socket, msg, {
+      chatJid,
+      senderJid,
+      fromMe: Boolean(key.fromMe),
+    });
 
     const isOwner = Boolean(ownerJid && senderJid === ownerJid);
     const isSudo = this.db.isOperator(senderJid);
