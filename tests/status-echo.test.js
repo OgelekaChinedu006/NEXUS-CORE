@@ -459,16 +459,37 @@ test('!echo soul never falls back to the invoking chat on owner or delivery fail
   assert.equal(deliveryFail.replies.length, 0);
 });
 
+test('!echo without a subcommand shows framed help for soul and realm', async () => {
+  const loaded = await registry();
+  const command = loaded.get('echo');
+  const { ctx, replies, contents, sent } = context({ args: [], argsText: '' });
+
+  await command.execute(ctx);
+
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].text, /☥ ECHO/);
+  assert.match(replies[0].text, /Retrieve a viewed status/);
+  assert.match(replies[0].text, /SOUL/);
+  assert.match(replies[0].text, /REALM/);
+  assert.match(replies[0].text, /!echo soul/);
+  assert.match(replies[0].text, /!echo realm/);
+  assert.match(replies[0].text, /private DM/);
+  assert.match(replies[0].text, /this chat/);
+  assert.equal(contents.length, 0);
+  assert.equal(sent.length, 0);
+});
+
 test('!echo does not claim success when content is missing, expired, or delivery fails', async () => {
   const loaded = await registry();
   const command = loaded.get('echo');
 
-  const usage = context({ args: [], argsText: '' });
+  const usage = context({ args: ['vv'], argsText: 'vv' });
   await assert.rejects(() => command.execute(usage.ctx), (error) => {
     assert.equal(error.message, ECHO_USAGE);
     return true;
   });
   assert.equal(usage.contents.length, 0);
+  assert.equal(usage.replies.length, 0);
 
   const missing = context({ args: ['realm'], quoted: null, statusCache: createStatusCache() });
   await assert.rejects(() => command.execute(missing.ctx), (error) => {
