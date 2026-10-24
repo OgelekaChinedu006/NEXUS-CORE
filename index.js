@@ -15,7 +15,11 @@ async function main() {
   const db = new NexusDatabase(config.dbPath);
   const registry = await loadCommands(config.commandsDir, logger);
   const services = createServices(config, logger);
-  const connection = new ConnectionManager({ config, logger });
+  const connection = new ConnectionManager({
+    config,
+    logger,
+    getCommandCount: () => registry.size,
+  });
   const handler = createHandler({ config, db, logger, registry, connection, services });
 
   connection.on('socket', (socket) => handler.attach(socket));

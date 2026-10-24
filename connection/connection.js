@@ -7,6 +7,8 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
+import { BOT_NAME } from '../config/config.js';
+import { isUserJid, normalizeJid } from '../lib/helpers.js';
 
 const PERMANENT_CLOSE_CODES = new Set([
   DisconnectReason.loggedOut,
@@ -26,6 +28,67 @@ const CONNECTION_STATES = new Set([
   'conflict',
   'failed',
 ]);
+
+export function resolvePrivateOwnerJid(value) {
+  const jid = normalizeJid(value);
+  if (!jid || !isUserJid(jid)) return null;
+  if (jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) {
+    return null;
+  }
+  return jid;
+}
+
+export function buildConnectionSuccessMessage({
+  botName = BOT_NAME,
+  prefix = '!',
+  version,
+  commandCount,
+} = {}) {
+  const lines = [
+    `╭━━━〔 ${botName || BOT_NAME} 〕━━━╮`,
+    '┃ STATUS: ONLINE',
+    '┃ CONNECTION: SUCCESSFUL',
+    `┃ PREFIX: ${prefix || '!'}`,
+  ];
+  if (version) lines.push(`┃ VERSION: ${version}`);
+  if (commandCount != null && Number.isFinite(Number(commandCount))) {
+    lines.push(`┃ COMMANDS: ${Number(commandCount)}`);
+  }
+  lines.push('┃ SYSTEM: READY', '╰━━━━━━━━━━━━━━━━━━━━╯');
+  return lines.join('\n');
+}
+
+export async function notifyOwnerConnectionSuccess({
+  socket,
+  config,
+  logger,
+  commandCount,
+} = {}) {
+  const ownerJid = resolvePrivateOwnerJid(config?.ownerJid);
+  if (!ownerJid) {
+    logger?.warn('Owner JID is missing or invalid; connection notification skipped.');
+    return { sent: false, reason: 'invalid-owner' };
+  }
+  if (!socket || typeof socket.sendMessage !== 'function') {
+    logger?.warn('No socket available for owner connection notification.');
+    return { sent: false, reason: 'no-socket' };
+  }
+
+  const text = buildConnectionSuccessMessage({
+    botName: config?.botName,
+    prefix: config?.prefix,
+    version: config?.version,
+    commandCount,
+  });
+
+  try {
+    await socket.sendMessage(ownerJid, { text });
+    return { sent: true, jid: ownerJid };
+  } catch (error) {
+    logger?.warn(`Owner connection notification failed: ${error.message}`);
+    return { sent: false, reason: 'send-failed' };
+  }
+}
 
 export function computeBackoff(attempt, {
   baseDelayMs = 3000,
@@ -50,10 +113,11 @@ function closeCode(lastDisconnect) {
 }
 
 export class ConnectionManager extends EventEmitter {
-  constructor({ config, logger }) {
+  constructor({ config, logger, getCommandCount } = {}) {
     super();
     this.config = config;
     this.logger = logger;
+    this.getCommandCount = typeof getCommandCount === 'function' ? getCommandCount : null;
     this.socket = null;
     this.state = 'idle';
     this.started = false;
@@ -65,6 +129,9 @@ export class ConnectionManager extends EventEmitter {
     this.pairingFailed = false;
     this.reconnectAttempt = 0;
     this.openedAt = null;
+    this._ownerNotifySentForOpen = false;
+    this._ownerNotifyInFlight = false;
+    this._ownerNotifyPromise = null;
     this.baileysLogger = pino({ level: 'silent' });
   }
 
@@ -204,6 +271,7 @@ export class ConnectionManager extends EventEmitter {
       this._setState('open');
       this.logger.info('Connection opened.');
       if (isNewLogin) this.logger.info('New WhatsApp session registered.');
+      this._notifyOwnerOnOpen(socket);
       this.emit('ready', this.socket);
       return;
     }
@@ -211,6 +279,7 @@ export class ConnectionManager extends EventEmitter {
     if (connection === 'close') {
       const code = closeCode(lastDisconnect);
       this.openedAt = null;
+      this._resetOwnerNotifyGate();
       this._disposeSocket();
       if (this.stopping) {
         this._setState('closed');
@@ -344,7 +413,44 @@ export class ConnectionManager extends EventEmitter {
     this.starting = false;
     this.reconnectAttempt = 0;
     this.openedAt = null;
+    this._resetOwnerNotifyGate();
     this._setState('idle');
     await this.start();
+  }
+
+  _resolveCommandCount() {
+    if (typeof this.getCommandCount !== 'function') return null;
+    try {
+      const value = this.getCommandCount();
+      const count = Number(value);
+      return Number.isFinite(count) ? count : null;
+    } catch {
+      return null;
+    }
+  }
+
+  _resetOwnerNotifyGate() {
+    this._ownerNotifySentForOpen = false;
+    this._ownerNotifyInFlight = false;
+  }
+
+  _notifyOwnerOnOpen(socket) {
+    if (this.stopping) return;
+    if (this._ownerNotifySentForOpen || this._ownerNotifyInFlight) return;
+    this._ownerNotifySentForOpen = true;
+    this._ownerNotifyInFlight = true;
+    this._ownerNotifyPromise = notifyOwnerConnectionSuccess({
+      socket,
+      config: this.config,
+      logger: this.logger,
+      commandCount: this._resolveCommandCount(),
+    })
+      .catch((error) => {
+        this.logger.warn(`Owner connection notification failed: ${error.message}`);
+        return { sent: false, reason: 'send-failed' };
+      })
+      .finally(() => {
+        this._ownerNotifyInFlight = false;
+      });
   }
 }
