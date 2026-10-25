@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
 import makeWASocket, {
   Browsers,
   DisconnectReason,
@@ -171,6 +172,8 @@ export class ConnectionManager extends EventEmitter {
 
   async _connect() {
     if (this.stopping) return;
+    this._replaceSocket(null);
+    fs.mkdirSync(this.config.sessionDir, { recursive: true });
     const { state, saveCreds } = await useMultiFileAuthState(this.config.sessionDir);
 
     let version;
@@ -199,7 +202,15 @@ export class ConnectionManager extends EventEmitter {
       keepAliveIntervalMs: 30000,
     });
 
-    this.socket = socket;
+    if (this.stopping) {
+      try {
+        socket.end(undefined);
+      } catch {
+        // Abandoned before listeners were attached.
+      }
+      return;
+    }
+    this._replaceSocket(socket);
     this.pairingRequested = false;
     this.pairingFailed = false;
 
@@ -351,6 +362,15 @@ export class ConnectionManager extends EventEmitter {
     }, delay);
   }
 
+  _endSocket(socket) {
+    if (!socket) return;
+    try {
+      socket.end(undefined);
+    } catch (error) {
+      this.logger?.debug?.(`Socket end failed: ${error.message}`);
+    }
+  }
+
   _disposeSocket() {
     if (this.pairingTimer) {
       clearTimeout(this.pairingTimer);
@@ -367,10 +387,16 @@ export class ConnectionManager extends EventEmitter {
     this.emit('socket-disposed', socket);
   }
 
-  async stop() {
-    if (this.stopping) return;
-    this.stopping = true;
-    this.started = false;
+  _replaceSocket(nextSocket) {
+    const previous = this.socket;
+    if (previous && previous !== nextSocket) {
+      this._disposeSocket();
+      this._endSocket(previous);
+    }
+    this.socket = nextSocket;
+  }
+
+  _clearTimers() {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -379,15 +405,26 @@ export class ConnectionManager extends EventEmitter {
       clearTimeout(this.pairingTimer);
       this.pairingTimer = null;
     }
+  }
+
+  async _awaitOwnerNotify() {
+    if (!this._ownerNotifyPromise) return;
+    try {
+      await this._ownerNotifyPromise;
+    } catch {
+      // Notification failures are already logged.
+    }
+  }
+
+  async stop() {
+    if (this.stopping) return;
+    this.stopping = true;
+    this.started = false;
+    this._clearTimers();
+    await this._awaitOwnerNotify();
     const socket = this.socket;
     this._disposeSocket();
-    if (socket) {
-      try {
-        socket.end(undefined);
-      } catch (error) {
-        this.logger.debug(`Socket end during shutdown failed: ${error.message}`);
-      }
-    }
+    this._endSocket(socket);
     this._setState('closed');
     this.logger.info('Connection stopped.');
   }
@@ -395,19 +432,11 @@ export class ConnectionManager extends EventEmitter {
   async restart() {
     if (this.starting) return;
     this.stopping = true;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
+    this._clearTimers();
+    await this._awaitOwnerNotify();
     const socket = this.socket;
     this._disposeSocket();
-    if (socket) {
-      try {
-        socket.end(undefined);
-      } catch {
-        // Ignore.
-      }
-    }
+    this._endSocket(socket);
     this.stopping = false;
     this.started = false;
     this.starting = false;

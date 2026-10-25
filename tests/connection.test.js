@@ -346,6 +346,94 @@ test('missing owner JID on open logs a warning and does not crash', async () => 
   await manager.stop();
 });
 
+test('reconnect exhaustion emits failed and does not leave a pending timer', async () => {
+  const manager = createTestManager({
+    config: { reconnect: { baseDelayMs: 10, maxDelayMs: 20, maxAttempts: 1, jitter: 0 } },
+  });
+  const socket = createFakeSocket();
+  manager.socket = socket;
+  manager._setState('open');
+
+  const failures = [];
+  manager.on('failed', (event) => failures.push(event));
+  manager._handleUpdate(socket, {
+    connection: 'close',
+    lastDisconnect: { error: { output: { statusCode: 500 } } },
+  });
+  assert.equal(manager.state, 'reconnecting');
+  assert.ok(manager.reconnectTimer);
+
+  if (manager.reconnectTimer) {
+    clearTimeout(manager.reconnectTimer);
+    manager.reconnectTimer = null;
+  }
+  manager.reconnectAttempt = manager.config.reconnect.maxAttempts;
+  manager._scheduleReconnect(false);
+
+  assert.equal(manager.state, 'failed');
+  assert.equal(manager.reconnectTimer, null);
+  assert.deepEqual(failures.at(-1), { code: null, permanent: false, exhausted: true });
+  await manager.stop();
+});
+
+test('logged-out and replaced connections do not reconnect', async () => {
+  const manager = createTestManager();
+  const first = createFakeSocket();
+  manager.socket = first;
+  manager._setState('open');
+  manager._handleUpdate(first, {
+    connection: 'close',
+    lastDisconnect: { error: { output: { statusCode: 401 } } },
+  });
+  assert.equal(manager.state, 'logged_out');
+  assert.equal(manager.reconnectTimer, null);
+
+  const second = createTestManager();
+  const socket = createFakeSocket();
+  second.socket = socket;
+  second._setState('open');
+  second._handleUpdate(socket, {
+    connection: 'close',
+    lastDisconnect: { error: { output: { statusCode: 440 } } },
+  });
+  assert.equal(second.state, 'conflict');
+  assert.equal(second.reconnectTimer, null);
+  await manager.stop();
+  await second.stop();
+});
+
+test('creating a new socket ends the previous socket to prevent duplicates', async () => {
+  const manager = createTestManager();
+  const previous = createFakeSocket();
+  const next = createFakeSocket();
+  manager.socket = previous;
+  manager._setState('open');
+  manager._replaceSocket(next);
+  assert.equal(manager.socket, next);
+  assert.equal(previous.removeAllListenersCalls, 1);
+  assert.equal(previous.endCalls, 1);
+  assert.equal(next.endCalls, 0);
+  await manager.stop();
+  assert.equal(next.endCalls, 1);
+});
+
+test('stop ends the current socket, clears timers, and is idempotent', async () => {
+  const manager = createTestManager();
+  const socket = createFakeSocket();
+  manager.socket = socket;
+  manager._setState('open');
+  manager.reconnectTimer = setTimeout(() => {}, 60_000);
+  manager.pairingTimer = setTimeout(() => {}, 60_000);
+  await manager.stop();
+  assert.equal(socket.endCalls, 1);
+  assert.equal(socket.removeAllListenersCalls, 1);
+  assert.equal(manager.reconnectTimer, null);
+  assert.equal(manager.pairingTimer, null);
+  assert.equal(manager.state, 'closed');
+  await manager.stop();
+  assert.equal(socket.endCalls, 1);
+});
+
 test('owner notification send failure keeps the connection open without retries', async () => {
   const logger = createCapturingLogger();
   let sendCalls = 0;

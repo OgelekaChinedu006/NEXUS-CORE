@@ -343,6 +343,33 @@ function normalizeJid(value) {
   return `${user.split(':')[0]}@${domain}`;
 }
 
+export function inspectOwnerJid(value) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return { configured: false, jid: null, reason: 'missing' };
+  }
+  const trimmed = String(value).trim();
+  if (!/^[^@\s]+@[^@\s]+$/.test(trimmed)) {
+    return { configured: true, jid: null, reason: 'malformed' };
+  }
+  const [user, domain] = trimmed.split('@');
+  const local = user.split(':')[0];
+  if (!local || !domain) {
+    return { configured: true, jid: null, reason: 'malformed' };
+  }
+  const jid = `${local}@${domain}`;
+  if (jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) {
+    return { configured: true, jid: null, reason: 'not-private' };
+  }
+  if (!jid.endsWith('@s.whatsapp.net') && !jid.endsWith('@lid')) {
+    return { configured: true, jid: null, reason: 'unsupported-domain' };
+  }
+  return { configured: true, jid, reason: null };
+}
+
+export function normalizeOwnerJid(value) {
+  return inspectOwnerJid(value).jid;
+}
+
 export function createConfig(env = process.env) {
   const authMethod = String(env.AUTH_METHOD || (env.PAIRING_NUMBER ? 'pairing' : 'qr')).toLowerCase();
   const pairingNumber = String(env.PAIRING_NUMBER || '').replace(/[^\d]/g, '');
@@ -355,9 +382,10 @@ export function createConfig(env = process.env) {
     version: packageJson.version,
     baileysVersion: packageJson.dependencies['@whiskeysockets/baileys'],
     prefix: normalizePrefix(env.PREFIX),
-    ownerJid: normalizeJid(env.OWNER_JID),
+    ownerJid: normalizeOwnerJid(env.OWNER_JID),
     dbPath: path.resolve(ROOT_DIR, env.DB_PATH || 'data/nexus-core.db'),
     sessionDir: path.resolve(ROOT_DIR, env.SESSION_DIR || 'data/session'),
+    instanceLockFile: '.nexus.lock',
     commandsDir: path.resolve(ROOT_DIR, 'commands'),
     logLevel: String(env.LOG_LEVEL || 'info').toLowerCase(),
     timezone: env.TIMEZONE || 'UTC',

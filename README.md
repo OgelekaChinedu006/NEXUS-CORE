@@ -17,23 +17,23 @@ The bot has not been connected to a live WhatsApp account in this environment. Q
 - Node.js `>=22.5.0`
 - npm
 - A WhatsApp account for the bot
-- Build tooling for `better-sqlite3` if a prebuilt binary is unavailable
+- Build tooling for `better-sqlite3` if a prebuilt binary is unavailable (`python3`, `make`, `g++`)
+- Ubuntu LTS plus systemd for VPS deployment (see `deploy/VPS.md`)
 
 ## Installation
 
 ```bash
-npm install
-cp .env.example .env
+npm ci
 ```
 
-Edit `.env` and set at least:
+On first start, `.env` is created from `.env.example` if it is missing. An existing `.env` is never overwritten. Edit `.env` and set at least:
 
 ```dotenv
 OWNER_JID=447700900123@s.whatsapp.net
 PREFIX=!
 ```
 
-`OWNER_JID` must be the owner's WhatsApp JID, not a display name. Display names are never trusted for authorization. Use the full international number followed by `@s.whatsapp.net` (for example `447700900123@s.whatsapp.net`).
+`OWNER_JID` must be the owner's WhatsApp JID, not a display name. Display names are never trusted for authorization. Use the full international number followed by `@s.whatsapp.net` (for example `447700900123@s.whatsapp.net`). Group, broadcast, and newsletter JIDs are rejected. Device suffixes such as `:12` are stripped.
 
 Start the bot:
 
@@ -68,14 +68,15 @@ The pairing code is printed once to the terminal and is not written to logs or d
 
 ### Session persistence
 
-Credentials are stored in `SESSION_DIR` (default `data/session`). They survive restarts. The directory is excluded from Git. Do not commit or share it.
+Credentials are stored in `SESSION_DIR` (default `data/session`). They survive restarts. The directory is excluded from Git. Do not commit or share it. A `.nexus.lock` file in that directory prevents a second process from using the same session.
 
 ### Logout and conflicts
 
 - A permanent logout (`loggedOut`) does not reconnect automatically. Delete the session directory only after understanding why the session was logged out, then restart and authenticate again.
 - A replaced connection (`connectionReplaced`) stops the socket to prevent duplicate sessions. Shut down the other instance before restarting.
-- Recoverable failures use bounded exponential backoff with jitter (`RECONNECT_*`). Reconnect loops and duplicate sockets are guarded.
-- `SIGINT` and `SIGTERM` trigger graceful shutdown of the handler, socket, and database.
+- Recoverable failures use bounded exponential backoff with jitter (`RECONNECT_*`). Reconnect loops and duplicate sockets are guarded. Exhausted reconnects exit so systemd can retry later.
+- Logged-out, forbidden, and replaced sessions do not reconnect. The process exits cleanly instead of looping.
+- `SIGINT` and `SIGTERM` trigger graceful shutdown of the handler, socket, database, and instance lock.
 
 ## Configuration
 
@@ -213,6 +214,7 @@ Add tests under `tests/`. Do not register a command until it has real behaviour,
 ```text
 index.js                    application entry point and shutdown
 config/config.js            environment parsing and defaults
+lib/env.js                  first-run .env creation from .env.example
 connection/connection.js    Baileys socket, auth state, reconnects
 handler/handler.js          message parsing, dispatch, security filters
 commands/                   command modules by category
@@ -225,12 +227,13 @@ lib/helpers.js              JIDs, validation, timeouts, randomness
 lib/calculator.js           safe expression evaluator
 services/                   AI, media, anime, weather, translation, utilities
 data/                       SQLite database and WhatsApp session (ignored)
+deploy/                     systemd unit and Ubuntu VPS notes
 tests/                      Node test runner suite
 ```
 
 ## Database
 
-SQLite is initialized automatically at `DB_PATH`. The schema includes:
+SQLite is initialized automatically at `DB_PATH`. The parent directory is created if missing. On close, a WAL checkpoint is attempted so the main database file is consistent. The schema includes:
 
 - `settings` for global prefix, absence mode, and notices
 - `groups` for per-group prefix, welcome/departure rites, laws, warnings, and wards
@@ -256,7 +259,8 @@ Current coverage:
 - permission checks and moderation-target validation
 - database settings, groups, warnings, moderation, bans, operators, allies, activity, economy, transfers, deduplication, and stats
 - formatter frames, menus, templates, and progress bars
-- bounded reconnect backoff and connection shutdown
+- bounded reconnect backoff, duplicate-socket disposal, logout/conflict handling, and connection shutdown
+- owner JID validation, storage directory creation, and single-instance session locking
 - handler ignore rules, deduplication, command context, permissions, timeouts, anti-link behavior, ally bypass, absence mode, rate limits, and participant events
 - command metadata, live menu counts, priority command coverage, sovereign commands, utility commands, and economy commands
 
@@ -270,7 +274,11 @@ Current coverage:
 
 **Admin commands fail.** The sender must be a group admin, and for actions that modify the group the bot must also be a group admin. Verify `botAdmin` in `!territory`.
 
-**Owner commands are sealed.** `OWNER_JID` is missing or does not match the sender's real JID. Display names are ignored.
+**Owner commands are sealed.** `OWNER_JID` is missing, malformed, or does not match the sender's real JID. Display names are ignored. Use `447700900123@s.whatsapp.net`, not a group JID.
+
+**Startup refuses with INSTANCE_LOCK.** Another process already holds `SESSION_DIR`. Stop that process. Delete `.nexus.lock` only if the recorded PID is dead.
+
+**VPS deployment.** See `deploy/VPS.md` for Ubuntu LTS, systemd, backups, and first-time WhatsApp linking.
 
 **`better-sqlite3` fails to install.** Install a C/C++ build toolchain and Python, then reinstall dependencies.
 
@@ -288,6 +296,7 @@ Current coverage:
 - [x] Identity, themed frames, footer, templates
 - [x] Utility category and economy core
 - [x] Automated tests and README
+- [x] Linux VPS readiness: storage lock, systemd unit, reconnect exit policy
 - [ ] AI, media, fun, advanced economy, anime/art catalogues
 - [ ] Live WhatsApp device verification in a deployment environment
 
