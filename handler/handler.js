@@ -17,6 +17,7 @@ import { warnUser } from '../lib/moderation.js';
 import { createGameManager } from '../lib/games/manager.js';
 import { createHorusMonitor } from '../lib/horus.js';
 import { createStatusCache, isStatusBroadcastJid } from '../lib/status-echo.js';
+import { identityJids, participantAliases, sessionIdentityJids } from '../lib/identity.js';
 import {
   applyBotCrushZone,
   canCrushRemove,
@@ -49,18 +50,25 @@ function isBaileysOutboundId(id) {
   return typeof id === 'string' && id.toUpperCase().startsWith(BAILEYS_MESSAGE_ID_PREFIX);
 }
 
-function sessionIdentityJids(user) {
-  if (!user || typeof user !== 'object') return [];
-  const jids = [];
-  for (const value of [user.id, user.lid, user.jid]) {
-    const normalized = normalizeJid(value);
-    if (normalized && !jids.includes(normalized)) jids.push(normalized);
-  }
-  return jids;
-}
-
 function isLinkedOwnerSession(ownerJid, user) {
   return Boolean(ownerJid && sessionIdentityJids(user).includes(ownerJid));
+}
+
+function participantJid(participant) {
+  if (typeof participant === 'string') return normalizeJid(participant);
+  if (!participant || typeof participant !== 'object') return null;
+  return normalizeJid(participant.id || participant.jid || participant.lid);
+}
+
+function participantIdentities(participant) {
+  if (typeof participant === 'string') {
+    const jid = normalizeJid(participant);
+    return jid ? [jid] : [];
+  }
+  const aliases = participantAliases(participant);
+  const primary = participantJid(participant);
+  if (primary && !aliases.includes(primary)) aliases.unshift(primary);
+  return aliases;
 }
 
 export function unwrapMessage(message, depth = 0) {
@@ -296,16 +304,17 @@ class MessageHandler {
     if (!Array.isArray(messages)) return;
     for (const message of messages) {
       try {
-        if (isStatusBroadcastJid(message?.key?.remoteJid)) {
-          this.statusCache.observe(message);
-          continue;
-        }
         const mentionHit = isStatusMentionOfTarget(message, {
           ownerJid: this.config.ownerJid,
           botJid: normalizeJid(socket.user?.id),
+          extraJids: sessionIdentityJids(socket.user),
         });
         if (mentionHit.ok) {
           await this.handleStatusMention(socket, message, mentionHit);
+        }
+        if (isStatusBroadcastJid(message?.key?.remoteJid)) {
+          this.statusCache.observe(message);
+          continue;
         }
         if (type !== 'notify') continue;
         await this.processMessage(socket, message);
@@ -327,10 +336,15 @@ class MessageHandler {
   }
 
   async handleStatusMention(socket, msg, mentionHit) {
-    const chatJid = msg?.key?.remoteJid;
+    const keyRemote = msg?.key?.remoteJid;
+    const chatJid = isStatusBroadcastJid(keyRemote)
+      ? (mentionHit.remoteJid && !isStatusBroadcastJid(mentionHit.remoteJid) ? mentionHit.remoteJid : null)
+      : keyRemote;
     if (!chatJid || isStatusBroadcastJid(chatJid)) return;
     const isGroup = isJidGroup(chatJid);
-    const senderJid = normalizeJid(msg.key?.participant || (isGroup ? null : chatJid));
+    const senderJid = normalizeJid(
+      mentionHit.participant || msg.key?.participant || (isGroup ? null : chatJid),
+    );
     if (!senderJid) return;
 
     const groupMeta = isGroup ? await this.getGroupMetadata(socket, chatJid) : null;
@@ -343,15 +357,20 @@ class MessageHandler {
     if (!setting.enabled) return;
 
     const botJid = normalizeJid(socket.user?.id);
-    const isOwner = Boolean(this.config.ownerJid && senderJid === this.config.ownerJid);
-    const isSudo = this.db.isOperator(senderJid);
+    const senderIds = identityJids(groupMeta, senderJid);
+    const isOwner = Boolean(
+      this.config.ownerJid && senderIds.includes(this.config.ownerJid),
+    );
+    const isSudo = senderIds.some((id) => this.db.isOperator(id));
     const isAdmin = isGroup ? isGroupAdmin(groupMeta, senderJid) : false;
-    const isAlly = isGroup ? this.db.isAlly(chatJid, senderJid) : false;
+    const isAlly = isGroup ? senderIds.some((id) => this.db.isAlly(chatJid, id)) : false;
     if (isExemptFromRunes({
       senderJid,
       botJid,
       ownerJid: this.config.ownerJid,
       groupMeta,
+      groupJid: isGroup ? chatJid : null,
+      db: this.db,
       isOwner,
       isSudo,
       isAdmin,
@@ -415,17 +434,18 @@ class MessageHandler {
       fromMe: Boolean(key.fromMe),
     });
 
-    const isOwner = Boolean(ownerJid && senderJid === ownerJid);
-    const isSudo = this.db.isOperator(senderJid);
-
-    if (!allowsAccess(getAccessMode(this.db), { isOwner, isSudo })) return;
-
-    if (!isOwner && this.db.isGloballyBanned(senderJid)) return;
-
     let groupMeta = null;
     if (isGroup) {
       groupMeta = await this.getGroupMetadata(socket, chatJid);
     }
+
+    const senderIds = identityJids(groupMeta, senderJid);
+    const isOwner = Boolean(ownerJid && (senderJid === ownerJid || senderIds.includes(ownerJid)));
+    const isSudo = senderIds.some((id) => this.db.isOperator(id));
+
+    if (!allowsAccess(getAccessMode(this.db), { isOwner, isSudo })) return;
+
+    if (!isOwner && this.db.isGloballyBanned(senderJid)) return;
 
     const group = isGroup
       ? this.db.ensureGroup(chatJid, groupMeta?.subject || null)
@@ -453,7 +473,10 @@ class MessageHandler {
     const targetJid = targets[0] || null;
 
     const isAdmin = isGroup ? isGroupAdmin(groupMeta, senderJid) : false;
-    const privileged = isOwner || isSudo || isAdmin || (isGroup && this.db.isAlly(chatJid, senderJid));
+    const privileged = isOwner
+      || isSudo
+      || isAdmin
+      || (isGroup && senderIds.some((id) => this.db.isAlly(chatJid, id)));
 
     if (isGroup && !privileged) {
       const filtered = await this.applySecurityFilters({
@@ -770,13 +793,20 @@ class MessageHandler {
   async applySecurityFilters({ socket, msg, chatJid, senderJid, group, groupMeta, botJid, text, isCommand }) {
     if (!group) return false;
 
-    const spamKey = `${chatJid}:${senderJid}`;
+    const senderKeys = identityJids(groupMeta, senderJid);
+    const spamKey = `${chatJid}:${senderKeys[0] || senderJid}`;
     const now = Date.now();
-    const bucket = (this.spamBuckets.get(spamKey) || []).filter(
-      (stamp) => now - stamp < this.config.security.spamWindowMs,
-    );
+    let bucket = [];
+    for (const id of senderKeys) {
+      const stamps = (this.spamBuckets.get(`${chatJid}:${id}`) || []).filter(
+        (stamp) => now - stamp < this.config.security.spamWindowMs,
+      );
+      if (stamps.length > bucket.length) bucket = stamps;
+    }
     bucket.push(now);
-    this.spamBuckets.set(spamKey, bucket);
+    for (const id of senderKeys.length ? senderKeys : [senderJid]) {
+      this.spamBuckets.set(`${chatJid}:${id}`, bucket);
+    }
 
     const mentions = getContextInfo(msg.message)?.mentionedJid || [];
     const botHandled = await this.applyBotRune({
@@ -794,6 +824,8 @@ class MessageHandler {
 
     const spamSetting = resolveRuneSetting(this.db, chatJid, 'spam');
     if (spamSetting.enabled && bucket.length >= this.config.security.spamThreshold) {
+      const eventId = `spam:${chatJid}:${msg.key?.id || ''}`;
+      if (!this.db.runes.claimEvent(eventId, 'spam')) return true;
       return this.enforceGroupRune({
         socket,
         msg,
@@ -808,7 +840,10 @@ class MessageHandler {
     if (isCommand) return false;
 
     const linkSetting = resolveRuneSetting(this.db, chatJid, 'link');
-    if (linkSetting.enabled && detectLink(text)) {
+    const unwrapped = unwrapMessage(msg.message);
+    if (linkSetting.enabled && detectLink(text, unwrapped)) {
+      const eventId = `link:${chatJid}:${msg.key?.id || ''}`;
+      if (!this.db.runes.claimEvent(eventId, 'link')) return true;
       return this.enforceGroupRune({
         socket,
         msg,
@@ -860,11 +895,12 @@ class MessageHandler {
     const setting = resolveRuneSetting(this.db, chatJid, 'bot');
     if (!setting.enabled) return false;
 
+    const senderKeys = identityJids(groupMeta, senderJid);
     let prefixTimestamps = [];
     if (detectKnownBotPrefix(text)) {
-      prefixTimestamps = this.prefixFlood.record(chatJid, senderJid, now);
+      prefixTimestamps = this.prefixFlood.record(chatJid, senderKeys, now);
     } else {
-      prefixTimestamps = this.prefixFlood.get(chatJid, senderJid, now);
+      prefixTimestamps = this.prefixFlood.get(chatJid, senderKeys, now);
     }
 
     const signals = crushSignals({
@@ -873,11 +909,10 @@ class MessageHandler {
       message: unwrapMessage(msg.message),
       prefixTimestamps,
     });
+    if (setting.mode !== 'crush') return false;
     if (!signals.matched) return false;
 
-    if (setting.mode !== 'crush') return false;
-
-    const joinedAt = this.joinTracker.get(chatJid, senderJid);
+    const joinedAt = this.joinTracker.get(chatJid, senderKeys);
     if (!canCrushRemove({ joinedAt, now, signals })) return false;
 
     const result = await applyBotCrushZone({
@@ -960,7 +995,7 @@ class MessageHandler {
 
     if (action === 'remove' && typeof this.games?.handlePlayerLeave === 'function') {
       for (const participant of participants) {
-        const target = normalizeJid(participant);
+        const target = participantJid(participant);
         if (!target) continue;
         await this.games.handlePlayerLeave(groupJid, target, { socket, groupMeta });
       }
@@ -968,9 +1003,9 @@ class MessageHandler {
 
     if (action === 'add') {
       for (const participant of participants) {
-        const target = normalizeJid(participant);
+        const target = participantJid(participant);
         if (!target) continue;
-        this.joinTracker.record(groupJid, target);
+        this.joinTracker.record(groupJid, participantIdentities(participant));
 
         if (this.db.isBannedFromGroup(groupJid, target) && isBotAdmin(groupMeta, botJid)) {
           try {
@@ -1016,7 +1051,7 @@ class MessageHandler {
 
     if (action === 'remove' && group?.goodbye_enabled) {
       for (const participant of participants) {
-        const target = normalizeJid(participant);
+        const target = participantJid(participant);
         if (!target || target === botJid) continue;
         const template = group.goodbye_text || this.config.welcome.defaultGoodbyeText;
         const text = goodbyeMessage({
