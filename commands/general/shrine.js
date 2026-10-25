@@ -86,6 +86,16 @@ function buildCaption(params) {
   const listed = [...header, ...listedSections, footer].join('\n');
   if (listed.length <= CAPTION_LIMIT) return listed;
 
+  const shortHeader = [
+    `╭━━『 ${String(botName).toUpperCase()} 』━━╮`,
+    `┃ COMMANDS: ${total}`,
+  ];
+  const listedShort = [...shortHeader, ...listedSections, footer].join('\n');
+  if (listedShort.length <= CAPTION_LIMIT) return listedShort;
+
+  const listedBare = [...shortHeader, ...listedSections].join('\n');
+  if (listedBare.length <= CAPTION_LIMIT) return listedBare;
+
   const compactSections = [];
   for (const category of categories) {
     compactSections.push(

@@ -17,6 +17,20 @@ import { warnUser } from '../lib/moderation.js';
 import { createGameManager } from '../lib/games/manager.js';
 import { createHorusMonitor } from '../lib/horus.js';
 import { createStatusCache, isStatusBroadcastJid } from '../lib/status-echo.js';
+import {
+  applyBotCrushZone,
+  canCrushRemove,
+  createJoinTracker,
+  createPrefixFloodTracker,
+  crushSignals,
+  detectKnownBotPrefix,
+  detectLink,
+  enforceRuneViolation,
+  handleCallRune,
+  isExemptFromRunes,
+  isStatusMentionOfTarget,
+} from '../lib/rune-engine.js';
+import { GLOBAL_RUNE_SCOPE, resolveRuneSetting } from '../lib/runes.js';
 
 const WRAPPER_KEYS = [
   'ephemeralMessage',
@@ -26,9 +40,9 @@ const WRAPPER_KEYS = [
   'documentWithCaptionMessage',
   'editedMessage',
   'deviceSentMessage',
+  'futureProofMessage',
 ];
 
-const URL_PATTERN = /\b(?:https?:\/\/|www\.)[^\s<>"']+/i;
 const BAILEYS_MESSAGE_ID_PREFIX = '3EB0';
 
 function isBaileysOutboundId(id) {
@@ -140,6 +154,7 @@ class MessageHandler {
     this.boundUpsert = null;
     this.boundParticipants = null;
     this.boundUpdates = null;
+    this.boundCall = null;
     this.metadataCache = new Map();
     this.rateBuckets = new Map();
     this.cooldowns = new Map();
@@ -147,6 +162,9 @@ class MessageHandler {
     this.securityActions = new Map();
     this.noticeBuckets = new Map();
     this.statusCache = createStatusCache();
+    this.joinTracker = createJoinTracker();
+    this.prefixFlood = createPrefixFloodTracker();
+    this.crushRemovals = new Set();
     this.pruneTimer = setInterval(() => this.pruneCaches(), 60000);
     this.pruneTimer.unref?.();
   }
@@ -169,9 +187,15 @@ class MessageHandler {
         this.logger.error(`Horus update failure: ${error.message}`);
       });
     };
+    this.boundCall = (event) => {
+      this.handleCall(socket, event).catch((error) => {
+        this.logger.error(`Call event failure: ${error.message}`);
+      });
+    };
     socket.ev.on('messages.upsert', this.boundUpsert);
     socket.ev.on('messages.update', this.boundUpdates);
     socket.ev.on('group-participants.update', this.boundParticipants);
+    socket.ev.on('call', this.boundCall);
   }
 
   detach() {
@@ -196,10 +220,18 @@ class MessageHandler {
         // Socket already disposed.
       }
     }
+    if (this.socket && this.boundCall) {
+      try {
+        this.socket.ev.off('call', this.boundCall);
+      } catch {
+        // Socket already disposed.
+      }
+    }
     this.socket = null;
     this.boundUpsert = null;
     this.boundParticipants = null;
     this.boundUpdates = null;
+    this.boundCall = null;
   }
 
   shutdown() {
@@ -247,6 +279,17 @@ class MessageHandler {
     } catch (error) {
       this.logger.debug(`Status cache prune failed: ${error.message}`);
     }
+    try {
+      this.joinTracker.prune(now);
+      this.prefixFlood.prune(now);
+    } catch (error) {
+      this.logger.debug(`Rune tracker prune failed: ${error.message}`);
+    }
+    try {
+      this.db.runes?.pruneEvents?.(86400);
+    } catch (error) {
+      this.logger.debug(`Rune event prune failed: ${error.message}`);
+    }
   }
 
   async handleUpsert(socket, { messages, type }) {
@@ -257,12 +300,82 @@ class MessageHandler {
           this.statusCache.observe(message);
           continue;
         }
+        const mentionHit = isStatusMentionOfTarget(message, {
+          ownerJid: this.config.ownerJid,
+          botJid: normalizeJid(socket.user?.id),
+        });
+        if (mentionHit.ok) {
+          await this.handleStatusMention(socket, message, mentionHit);
+        }
         if (type !== 'notify') continue;
         await this.processMessage(socket, message);
       } catch (error) {
         this.logger.error(`Message processing failure: ${error.message}`);
       }
     }
+  }
+
+  async handleCall(socket, event) {
+    await handleCallRune({
+      db: this.db,
+      sock: socket,
+      logger: this.logger,
+      ownerJid: this.config.ownerJid,
+      botJid: normalizeJid(socket.user?.id),
+      callEvent: event,
+    });
+  }
+
+  async handleStatusMention(socket, msg, mentionHit) {
+    const chatJid = msg?.key?.remoteJid;
+    if (!chatJid || isStatusBroadcastJid(chatJid)) return;
+    const isGroup = isJidGroup(chatJid);
+    const senderJid = normalizeJid(msg.key?.participant || (isGroup ? null : chatJid));
+    if (!senderJid) return;
+
+    const groupMeta = isGroup ? await this.getGroupMetadata(socket, chatJid) : null;
+    if (isGroup) this.db.ensureGroup(chatJid, groupMeta?.subject || null);
+    let setting = resolveRuneSetting(this.db, chatJid, 'mention');
+    if (setting.source === 'default') {
+      const globalSetting = resolveRuneSetting(this.db, GLOBAL_RUNE_SCOPE, 'mention');
+      if (globalSetting.source === 'rune') setting = globalSetting;
+    }
+    if (!setting.enabled) return;
+
+    const botJid = normalizeJid(socket.user?.id);
+    const isOwner = Boolean(this.config.ownerJid && senderJid === this.config.ownerJid);
+    const isSudo = this.db.isOperator(senderJid);
+    const isAdmin = isGroup ? isGroupAdmin(groupMeta, senderJid) : false;
+    const isAlly = isGroup ? this.db.isAlly(chatJid, senderJid) : false;
+    if (isExemptFromRunes({
+      senderJid,
+      botJid,
+      ownerJid: this.config.ownerJid,
+      groupMeta,
+      isOwner,
+      isSudo,
+      isAdmin,
+      isAlly,
+    })) return;
+
+    const eventId = `mention:${mentionHit.eventId}`;
+    if (!this.db.runes.claimEvent(eventId, 'mention')) return;
+
+    await enforceRuneViolation({
+      db: this.db,
+      sock: socket,
+      logger: this.logger,
+      rune: 'mention',
+      scope: setting.scope,
+      chatJid,
+      userJid: senderJid,
+      mode: setting.mode,
+      punishment: setting.punishment,
+      msg,
+      groupMeta,
+      botJid,
+      deleteOffending: Boolean(isGroup && msg?.key),
+    });
   }
 
   async processMessage(socket, msg) {
@@ -665,33 +778,45 @@ class MessageHandler {
     bucket.push(now);
     this.spamBuckets.set(spamKey, bucket);
 
-    if (group.antispam && bucket.length >= this.config.security.spamThreshold) {
-      return this.securityAction({
+    const mentions = getContextInfo(msg.message)?.mentionedJid || [];
+    const botHandled = await this.applyBotRune({
+      socket,
+      msg,
+      chatJid,
+      senderJid,
+      groupMeta,
+      botJid,
+      text,
+      mentions,
+      now,
+    });
+    if (botHandled) return true;
+
+    const spamSetting = resolveRuneSetting(this.db, chatJid, 'spam');
+    if (spamSetting.enabled && bucket.length >= this.config.security.spamThreshold) {
+      return this.enforceGroupRune({
         socket,
         msg,
         chatJid,
         senderJid,
-        group,
         groupMeta,
         botJid,
-        actionKey: `spam:${spamKey}`,
-        offense: 'Overwhelming cursed energy (message flood)',
+        setting: spamSetting,
       });
     }
 
     if (isCommand) return false;
 
-    if (group.antilink && URL_PATTERN.test(text)) {
-      return this.securityAction({
+    const linkSetting = resolveRuneSetting(this.db, chatJid, 'link');
+    if (linkSetting.enabled && detectLink(text)) {
+      return this.enforceGroupRune({
         socket,
         msg,
         chatJid,
         senderJid,
-        group,
         groupMeta,
         botJid,
-        actionKey: `link:${spamKey}`,
-        offense: 'Smuggling an outside link into the domain',
+        setting: linkSetting,
       });
     }
 
@@ -710,6 +835,71 @@ class MessageHandler {
     }
 
     return false;
+  }
+
+  async enforceGroupRune({ socket, msg, chatJid, senderJid, groupMeta, botJid, setting }) {
+    await enforceRuneViolation({
+      db: this.db,
+      sock: socket,
+      logger: this.logger,
+      rune: setting.rune,
+      scope: setting.scope,
+      chatJid,
+      userJid: senderJid,
+      mode: setting.mode,
+      punishment: setting.punishment,
+      msg,
+      groupMeta,
+      botJid,
+      deleteOffending: true,
+    });
+    return true;
+  }
+
+  async applyBotRune({ socket, msg, chatJid, senderJid, groupMeta, botJid, text, mentions, now }) {
+    const setting = resolveRuneSetting(this.db, chatJid, 'bot');
+    if (!setting.enabled) return false;
+
+    let prefixTimestamps = [];
+    if (detectKnownBotPrefix(text)) {
+      prefixTimestamps = this.prefixFlood.record(chatJid, senderJid, now);
+    } else {
+      prefixTimestamps = this.prefixFlood.get(chatJid, senderJid, now);
+    }
+
+    const signals = crushSignals({
+      text,
+      mentions,
+      message: unwrapMessage(msg.message),
+      prefixTimestamps,
+    });
+    if (!signals.matched) return false;
+
+    if (setting.mode !== 'crush') return false;
+
+    const joinedAt = this.joinTracker.get(chatJid, senderJid);
+    if (!canCrushRemove({ joinedAt, now, signals })) return false;
+
+    const result = await applyBotCrushZone({
+      sock: socket,
+      db: this.db,
+      logger: this.logger,
+      groupJid: chatJid,
+      groupMeta,
+      botJid,
+      ownerJid: this.config.ownerJid,
+      targetJid: senderJid,
+      actorJid: botJid,
+      msg,
+      joinedAt,
+      signals,
+      now,
+      removalGuard: this.crushRemovals,
+    });
+    if (result.failures?.length) {
+      this.logger.warn(`Bot Rune crush incomplete: ${result.failures.join('; ')}`);
+    }
+    return true;
   }
 
   containsProfanity(text) {
@@ -780,6 +970,7 @@ class MessageHandler {
       for (const participant of participants) {
         const target = normalizeJid(participant);
         if (!target) continue;
+        this.joinTracker.record(groupJid, target);
 
         if (this.db.isBannedFromGroup(groupJid, target) && isBotAdmin(groupMeta, botJid)) {
           try {

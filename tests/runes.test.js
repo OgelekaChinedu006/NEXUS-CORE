@@ -1,0 +1,849 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import Database from 'better-sqlite3';
+import { createHandler } from '../handler/handler.js';
+import { NexusDatabase } from '../lib/database.js';
+import { createLogger } from '../lib/logger.js';
+import { CommandError } from '../lib/helpers.js';
+import {
+  GLOBAL_RUNE_SCOPE,
+  RuneStore,
+  describeRuneSetting,
+  resolveRuneSetting,
+} from '../lib/runes.js';
+import {
+  applyBotCrushZone,
+  applyBotLockdown,
+  canCrushRemove,
+  classifyCall,
+  crushSignals,
+  enforceRuneViolation,
+  handleCallRune,
+  isExemptFromRunes,
+  isStatusMentionOfTarget,
+} from '../lib/rune-engine.js';
+import { executeRuneCommand } from '../lib/rune-commands.js';
+
+const GROUP = '120363000000000000@g.us';
+const OTHER_GROUP = '120363111111111111@g.us';
+const MEMBER = '111@s.whatsapp.net';
+const OTHER = '444@s.whatsapp.net';
+const ADMIN = '222@s.whatsapp.net';
+const SUDO = '333@s.whatsapp.net';
+const BOT = '999@s.whatsapp.net';
+const OWNER = 'owner@s.whatsapp.net';
+const ALLY = '555@s.whatsapp.net';
+const CALLER = '666@s.whatsapp.net';
+const logger = createLogger({ level: 'silent' });
+
+function freshDb(t) {
+  const db = new NexusDatabase(':memory:');
+  t.after(() => db.close());
+  return db;
+}
+
+function makeConfig(overrides = {}) {
+  return {
+    prefix: '!',
+    ownerJid: OWNER,
+    ownerDisplay: 'The Sovereign',
+    botName: 'TEST CORE',
+    footer: 'POWERED BY TEST CORE',
+    version: '1.0.0',
+    locale: 'en-GB',
+    timezone: 'UTC',
+    groupMetadataTtlMs: 1000,
+    executionTimeoutMs: 1000,
+    rateLimit: { windowMs: 10000, maxCommands: 8, noticeCooldownMs: 1000 },
+    security: {
+      spamWindowMs: 6000,
+      spamThreshold: 7,
+      profanityWords: ['badword'],
+      actionCooldownMs: 1000,
+      maxMentions: 120,
+    },
+    welcome: {
+      defaultText: '{user} entered {group}.',
+      defaultGoodbyeText: '{user} left {group}.',
+    },
+    ...overrides,
+  };
+}
+
+function makeGroupMeta({ botAdmin = true, extra = [] } = {}) {
+  return {
+    subject: 'Test Domain',
+    desc: 'Obey.',
+    size: 4,
+    owner: ADMIN,
+    participants: [
+      { id: MEMBER },
+      { id: OTHER },
+      { id: ALLY },
+      { id: ADMIN, admin: 'superadmin' },
+      { id: BOT, admin: botAdmin ? 'admin' : undefined },
+      ...extra,
+    ],
+  };
+}
+
+function makeSocket(groupMeta = makeGroupMeta(), { failDelete = false, failKick = false, failReject = false, failBlock = false } = {}) {
+  const sent = [];
+  const settings = [];
+  const memberAdd = [];
+  const removed = [];
+  const rejected = [];
+  const blocked = [];
+  return {
+    user: { id: BOT },
+    sent,
+    settings,
+    memberAdd,
+    removed,
+    rejected,
+    blocked,
+    ev: { on() {}, off() {}, removeAllListeners() {} },
+    async sendMessage(jid, content, options = {}) {
+      if (content?.delete && failDelete) throw new Error('delete refused');
+      sent.push({ jid, content, options });
+      return { key: { id: `sent-${sent.length}` } };
+    },
+    async groupMetadata() {
+      return groupMeta;
+    },
+    async groupParticipantsUpdate(jid, targets, action) {
+      if (action === 'remove' && failKick) throw new Error('kick refused');
+      if (action === 'remove') removed.push(...targets);
+      return [];
+    },
+    async groupSettingUpdate(jid, setting) {
+      settings.push({ jid, setting });
+    },
+    async groupMemberAddMode(jid, mode) {
+      memberAdd.push({ jid, mode });
+    },
+    async rejectCall(id, from) {
+      if (failReject) throw new Error('reject refused');
+      rejected.push({ id, from });
+    },
+    async updateBlockStatus(jid, action) {
+      if (failBlock) throw new Error('block refused');
+      blocked.push({ jid, action });
+    },
+  };
+}
+
+function makeMessage({
+  id = 'MSG1',
+  chat = GROUP,
+  sender = MEMBER,
+  text = 'hello',
+  fromMe = false,
+  message,
+} = {}) {
+  return {
+    key: {
+      id,
+      remoteJid: chat,
+      fromMe,
+      ...(sender ? { participant: sender } : {}),
+    },
+    message: message || { conversation: text },
+  };
+}
+
+function makeRegistry() {
+  return {
+    get: () => null,
+    size: 0,
+    all: () => [],
+    categories: () => [],
+  };
+}
+
+function createHarness(t, { config = {}, groupMeta, botAdmin = true, socketOptions } = {}) {
+  const db = new NexusDatabase(':memory:');
+  db.setSetting('access_mode', 'awaken');
+  const meta = groupMeta || makeGroupMeta({ botAdmin });
+  const socket = makeSocket(meta, socketOptions);
+  const handler = createHandler({
+    config: makeConfig(config),
+    db,
+    logger,
+    registry: makeRegistry(),
+    connection: { state: 'open' },
+    services: {},
+  });
+  handler.attach(socket);
+  t.after(() => {
+    handler.shutdown();
+    db.close();
+  });
+  return { db, socket, handler, meta };
+}
+
+function runeCtx(db, overrides = {}) {
+  const replies = [];
+  const ctx = {
+    prefix: '!',
+    args: [],
+    argsText: '',
+    senderJid: ADMIN,
+    botJid: BOT,
+    targetJid: null,
+    targetJids: [],
+    isGroup: true,
+    isOwner: false,
+    isSudo: false,
+    isAdmin: true,
+    isBotAdmin: true,
+    chatJid: GROUP,
+    config: makeConfig(),
+    db,
+    groupMeta: makeGroupMeta(),
+    group: db.ensureGroup(GROUP, 'Test Domain'),
+    logger,
+    sock: makeSocket(),
+    reply: async (text, options = {}) => {
+      replies.push({ text, options });
+      return { ok: true };
+    },
+    ...overrides,
+  };
+  return { ctx, replies };
+}
+
+test('rune schema is created on fresh and existing databases without dropping columns', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexus-runes-'));
+  const filePath = path.join(dir, 'nexus-core.db');
+  const raw = new Database(filePath);
+  raw.exec(`
+    CREATE TABLE groups (
+      jid TEXT PRIMARY KEY,
+      name TEXT,
+      antilink INTEGER NOT NULL DEFAULT 0,
+      antispam INTEGER NOT NULL DEFAULT 0,
+      profanity INTEGER NOT NULL DEFAULT 0,
+      max_warnings INTEGER NOT NULL DEFAULT 3,
+      member_add_mode TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE warnings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      group_jid TEXT NOT NULL,
+      user_jid TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      issued_by TEXT,
+      created_at INTEGER NOT NULL
+    );
+  `);
+  raw.prepare(
+    'INSERT INTO groups (jid, name, antilink, antispam, profanity, max_warnings, created_at, updated_at) VALUES (?, ?, 1, 1, 1, 5, 1, 1)',
+  ).run(GROUP, 'Legacy');
+  raw.prepare(
+    'INSERT INTO warnings (group_jid, user_jid, reason, issued_by, created_at) VALUES (?, ?, ?, ?, 1)',
+  ).run(GROUP, MEMBER, 'legacy', ADMIN);
+  raw.close();
+
+  const db = new NexusDatabase(filePath);
+  t.after(() => {
+    db.close();
+    fs.unlinkSync(filePath);
+  });
+
+  const tables = db.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name);
+  assert.ok(tables.includes('rune_settings'));
+  assert.ok(tables.includes('rune_violations'));
+  assert.ok(tables.includes('rune_events'));
+  const groupColumns = db.db.prepare('PRAGMA table_info(groups)').all().map((column) => column.name);
+  assert.ok(groupColumns.includes('antilink'));
+  assert.ok(groupColumns.includes('antispam'));
+  assert.ok(groupColumns.includes('profanity'));
+  assert.ok(groupColumns.includes('max_warnings'));
+  assert.ok(groupColumns.includes('member_add_mode'));
+  assert.equal(db.getGroup(GROUP).antilink, 1);
+  assert.equal(db.countWarnings(GROUP, MEMBER), 1);
+  RuneStore.ensureSchema(db.db);
+  assert.equal(db.getGroup(GROUP).antilink, 1);
+
+  const memory = freshDb(t);
+  const memoryTables = memory.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name);
+  assert.ok(memoryTables.includes('rune_settings'));
+});
+
+test('legacy dual-read maps antilink/antispam until an explicit rune setting exists', (t) => {
+  const db = freshDb(t);
+  db.ensureGroup(GROUP, 'Domain');
+  db.updateGroup(GROUP, { antilink: 1, antispam: 0 });
+  const link = resolveRuneSetting(db, GROUP, 'link');
+  const spam = resolveRuneSetting(db, GROUP, 'spam');
+  assert.equal(link.enabled, true);
+  assert.equal(link.mode, 'grace');
+  assert.equal(link.punishment, 'kick');
+  assert.equal(link.source, 'legacy');
+  assert.equal(spam.enabled, false);
+  assert.equal(spam.source, 'legacy');
+
+  db.runes.setSetting(GROUP, 'link', { enabled: false, mode: 'mercy' });
+  const overridden = resolveRuneSetting(db, GROUP, 'link');
+  assert.equal(overridden.enabled, false);
+  assert.equal(overridden.mode, 'mercy');
+  assert.equal(overridden.source, 'rune');
+  assert.equal(db.getGroup(GROUP).antilink, 1);
+  assert.equal(db.getGroup(GROUP).profanity, 0);
+});
+
+test('grace counts independently by rune, user and chat and resets only after successful punishment', async (t) => {
+  const db = freshDb(t);
+  const sock = makeSocket();
+  const meta = makeGroupMeta();
+  const opts = {
+    db,
+    sock,
+    logger,
+    groupMeta: meta,
+    botJid: BOT,
+    deleteOffending: false,
+  };
+
+  for (let index = 1; index <= 3; index += 1) {
+    const result = await enforceRuneViolation({
+      ...opts,
+      rune: 'link',
+      scope: GROUP,
+      chatJid: GROUP,
+      userJid: MEMBER,
+      mode: 'grace',
+    });
+    assert.equal(result.warned, true);
+    assert.equal(result.punished, false);
+    assert.equal(result.count, index);
+  }
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 0);
+  assert.equal(db.runes.getViolationCount(GROUP, OTHER, 'link'), 0);
+  assert.equal(db.runes.getViolationCount(OTHER_GROUP, MEMBER, 'link'), 0);
+
+  const punished = await enforceRuneViolation({
+    ...opts,
+    rune: 'link',
+    scope: GROUP,
+    chatJid: GROUP,
+    userJid: MEMBER,
+    mode: 'grace',
+  });
+  assert.equal(punished.punished, true);
+  assert.equal(punished.reset, true);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 0);
+});
+
+test('failed grace punishment retains the count and reports the failure', async (t) => {
+  const db = freshDb(t);
+  db.runes.incrementViolation(GROUP, MEMBER, 'link');
+  db.runes.incrementViolation(GROUP, MEMBER, 'link');
+  db.runes.incrementViolation(GROUP, MEMBER, 'link');
+  const sock = makeSocket(makeGroupMeta(), { failKick: true });
+  const result = await enforceRuneViolation({
+    db,
+    sock,
+    logger,
+    rune: 'link',
+    scope: GROUP,
+    chatJid: GROUP,
+    userJid: MEMBER,
+    mode: 'grace',
+    groupMeta: makeGroupMeta(),
+    botJid: BOT,
+    deleteOffending: false,
+  });
+  assert.equal(result.punished, false);
+  assert.equal(result.reset, false);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 4);
+  assert.ok(result.failures.some((entry) => /kick refused|lacks admin/i.test(entry)));
+  assert.ok(sock.sent.some((entry) => /FAILED/.test(entry.content.text || '')));
+});
+
+test('mercy warns without accumulating grace counts and exile punishes without warning', async (t) => {
+  const db = freshDb(t);
+  const sock = makeSocket();
+  const mercy = await enforceRuneViolation({
+    db,
+    sock,
+    logger,
+    rune: 'spam',
+    scope: GROUP,
+    chatJid: GROUP,
+    userJid: MEMBER,
+    mode: 'mercy',
+    groupMeta: makeGroupMeta(),
+    botJid: BOT,
+    deleteOffending: false,
+  });
+  assert.equal(mercy.warned, true);
+  assert.equal(mercy.punished, false);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 0);
+
+  const exileSock = makeSocket();
+  const exile = await enforceRuneViolation({
+    db,
+    sock: exileSock,
+    logger,
+    rune: 'spam',
+    scope: GROUP,
+    chatJid: GROUP,
+    userJid: MEMBER,
+    mode: 'exile',
+    groupMeta: makeGroupMeta(),
+    botJid: BOT,
+    deleteOffending: false,
+  });
+  assert.equal(exile.warned, false);
+  assert.equal(exile.punished, true);
+  assert.deepEqual(exileSock.removed, [MEMBER]);
+  assert.ok(!exileSock.sent.some((entry) => /MARKS:/.test(entry.content.text || '')));
+});
+
+test('authorized reset is scoped to one rune, user and chat', (t) => {
+  const db = freshDb(t);
+  db.runes.incrementViolation(GROUP, MEMBER, 'link');
+  db.runes.incrementViolation(GROUP, MEMBER, 'spam');
+  db.runes.incrementViolation(GROUP, OTHER, 'link');
+  db.runes.incrementViolation(OTHER_GROUP, MEMBER, 'link');
+  assert.equal(db.runes.resetViolation(GROUP, MEMBER, 'link'), 1);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 0);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
+  assert.equal(db.runes.getViolationCount(GROUP, OTHER, 'link'), 1);
+  assert.equal(db.runes.getViolationCount(OTHER_GROUP, MEMBER, 'link'), 1);
+});
+
+test('duplicate rune events are claimed once', (t) => {
+  const db = freshDb(t);
+  assert.equal(db.runes.claimEvent('call-1', 'call'), true);
+  assert.equal(db.runes.claimEvent('call-1', 'call'), false);
+  assert.equal(db.runes.claimEvent('call-1', 'mention'), true);
+});
+
+test('failed deletions are reported and never claimed as success', async (t) => {
+  const db = freshDb(t);
+  const sock = makeSocket(makeGroupMeta(), { failDelete: true });
+  const msg = makeMessage({ id: 'DEL1' });
+  const result = await enforceRuneViolation({
+    db,
+    sock,
+    logger,
+    rune: 'link',
+    scope: GROUP,
+    chatJid: GROUP,
+    userJid: MEMBER,
+    mode: 'mercy',
+    groupMeta: makeGroupMeta(),
+    botJid: BOT,
+    msg,
+  });
+  assert.equal(result.deleted, false);
+  assert.ok(result.failures.some((entry) => /Delete failed/.test(entry)));
+  assert.ok(sock.sent.some((entry) => /Delete failed/.test(entry.content.text || '')));
+});
+
+test('owner, sudo, admin and ally are exempt from runes; allies have no moderation powers', () => {
+  const meta = makeGroupMeta();
+  assert.equal(isExemptFromRunes({ senderJid: OWNER, ownerJid: OWNER, isOwner: true }), true);
+  assert.equal(isExemptFromRunes({ senderJid: SUDO, isSudo: true }), true);
+  assert.equal(isExemptFromRunes({ senderJid: ADMIN, groupMeta: meta, isAdmin: true }), true);
+  assert.equal(isExemptFromRunes({ senderJid: ALLY, isAlly: true }), true);
+  assert.equal(isExemptFromRunes({ senderJid: MEMBER, groupMeta: meta }), false);
+});
+
+test('status mentions of the owner are detected; ordinary @mentions are not', () => {
+  const ordinary = {
+    key: { id: 'M1', remoteJid: GROUP, participant: MEMBER },
+    message: {
+      extendedTextMessage: {
+        text: 'hello',
+        contextInfo: { mentionedJid: [OWNER] },
+      },
+    },
+  };
+  assert.equal(isStatusMentionOfTarget(ordinary, { ownerJid: OWNER, botJid: BOT }).ok, false);
+
+  const statusMention = {
+    key: { id: 'S1', remoteJid: GROUP, participant: MEMBER },
+    message: {
+      futureProofMessage: {
+        message: {
+          statusMentionMessage: {
+            message: {
+              extendedTextMessage: {
+                text: 'status',
+                contextInfo: {
+                  remoteJid: 'status@broadcast',
+                  mentionedJid: [OWNER],
+                  stanzaId: 'STATUS1',
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+  const hit = isStatusMentionOfTarget(statusMention, { ownerJid: OWNER, botJid: BOT });
+  assert.equal(hit.ok, true);
+  assert.equal(hit.targetJid, OWNER);
+  assert.equal(hit.eventId, 'STATUS1');
+});
+
+test('bot lockdown never removes members', async () => {
+  const sock = makeSocket();
+  const db = { updateGroup() {}, logModeration() {} };
+  const result = await applyBotLockdown({ sock, groupJid: GROUP, db, actorJid: BOT, logger });
+  assert.equal(result.removed, false);
+  assert.deepEqual(sock.removed, []);
+  assert.equal(sock.settings[0].setting, 'announcement');
+  assert.equal(sock.memberAdd[0].mode, 'admin_add');
+});
+
+test('crush zone requires join window plus two signals and validates targets', async () => {
+  const now = Date.now();
+  const mentions = Array.from({ length: 10 }, (_, index) => `${100 + index}@s.whatsapp.net`);
+  const signals = crushSignals({
+    text: '!attack',
+    mentions,
+    message: { groupInviteMessage: { groupJid: GROUP } },
+    prefixTimestamps: [now, now + 1, now + 2],
+  });
+  assert.ok(signals.matched >= 2);
+  assert.equal(canCrushRemove({ joinedAt: now - 10_000, now, signals }), true);
+  assert.equal(canCrushRemove({ joinedAt: now - 70_000, now, signals }), false);
+
+  const sock = makeSocket();
+  const db = {
+    isOperator: () => false,
+    isAlly: () => false,
+    updateGroup() {},
+    logModeration() {},
+  };
+  const protectedResult = await applyBotCrushZone({
+    sock,
+    db,
+    logger,
+    groupJid: GROUP,
+    groupMeta: makeGroupMeta(),
+    botJid: BOT,
+    ownerJid: OWNER,
+    targetJid: ADMIN,
+    actorJid: BOT,
+    joinedAt: now,
+    signals,
+    now,
+    removalGuard: new Set(),
+  });
+  assert.equal(protectedResult.removed, false);
+
+  const removed = await applyBotCrushZone({
+    sock,
+    db,
+    logger,
+    groupJid: GROUP,
+    groupMeta: makeGroupMeta(),
+    botJid: BOT,
+    ownerJid: OWNER,
+    targetJid: MEMBER,
+    actorJid: BOT,
+    joinedAt: now,
+    signals,
+    now,
+    removalGuard: new Set(),
+  });
+  assert.equal(removed.removed, true);
+  assert.deepEqual(sock.removed, [MEMBER]);
+});
+
+test('call mercy rejects without blocking; grace blocks only on the fourth qualifying call', async (t) => {
+  const db = freshDb(t);
+  db.runes.setSetting(GLOBAL_RUNE_SCOPE, 'call', { enabled: true, mode: 'mercy' });
+  const sock = makeSocket();
+  const offer = { id: 'C1', from: CALLER, status: 'offer' };
+  const mercy = await handleCallRune({ db, sock, logger, ownerJid: OWNER, botJid: BOT, callEvent: offer });
+  assert.equal(mercy.rejected, true);
+  assert.equal(mercy.blocked, false);
+  assert.deepEqual(sock.blocked, []);
+  const duplicate = await handleCallRune({ db, sock, logger, ownerJid: OWNER, botJid: BOT, callEvent: offer });
+  assert.equal(duplicate.skipped, true);
+  assert.equal(duplicate.reason, 'duplicate');
+
+  db.runes.setSetting(GLOBAL_RUNE_SCOPE, 'call', { enabled: true, mode: 'grace' });
+  const graceSock = makeSocket();
+  for (let index = 1; index <= 3; index += 1) {
+    const result = await handleCallRune({
+      db,
+      sock: graceSock,
+      logger,
+      ownerJid: OWNER,
+      botJid: BOT,
+      callEvent: { id: `G${index}`, from: CALLER, status: 'offer' },
+    });
+    assert.equal(result.blocked, false);
+    assert.equal(result.count, index);
+  }
+  const fourth = await handleCallRune({
+    db,
+    sock: graceSock,
+    logger,
+    ownerJid: OWNER,
+    botJid: BOT,
+    callEvent: { id: 'G4', from: CALLER, status: 'offer' },
+  });
+  assert.equal(fourth.blocked, true);
+  assert.deepEqual(graceSock.blocked, [{ jid: CALLER, action: 'block' }]);
+  assert.equal(db.runes.getViolationCount(GLOBAL_RUNE_SCOPE, CALLER, 'call'), 0);
+});
+
+test('call rune ignores group calls, owner/sudo callers, and failed reject/block APIs', async (t) => {
+  const db = freshDb(t);
+  db.runes.setSetting(GLOBAL_RUNE_SCOPE, 'call', { enabled: true, mode: 'grace' });
+  db.addOperator(SUDO, OWNER);
+  const sock = makeSocket();
+  assert.equal(classifyCall({ id: 'X', from: CALLER, status: 'ringing' }).ok, false);
+  const group = await handleCallRune({
+    db,
+    sock,
+    logger,
+    ownerJid: OWNER,
+    botJid: BOT,
+    callEvent: { id: 'G', from: CALLER, status: 'offer', isGroup: true },
+  });
+  assert.equal(group.skipped, true);
+  const ownerCall = await handleCallRune({
+    db,
+    sock,
+    logger,
+    ownerJid: OWNER,
+    botJid: BOT,
+    callEvent: { id: 'O', from: OWNER, status: 'offer' },
+  });
+  assert.equal(ownerCall.skipped, true);
+  const sudoCall = await handleCallRune({
+    db,
+    sock,
+    logger,
+    ownerJid: OWNER,
+    botJid: BOT,
+    callEvent: { id: 'S', from: SUDO, status: 'offer' },
+  });
+  assert.equal(sudoCall.skipped, true);
+
+  const failSock = makeSocket(makeGroupMeta(), { failReject: true, failBlock: true });
+  db.runes.incrementViolation(GLOBAL_RUNE_SCOPE, CALLER, 'call');
+  db.runes.incrementViolation(GLOBAL_RUNE_SCOPE, CALLER, 'call');
+  db.runes.incrementViolation(GLOBAL_RUNE_SCOPE, CALLER, 'call');
+  const failed = await handleCallRune({
+    db,
+    sock: failSock,
+    logger,
+    ownerJid: OWNER,
+    botJid: BOT,
+    callEvent: { id: 'F4', from: CALLER, status: 'offer' },
+  });
+  assert.equal(failed.rejected, false);
+  assert.equal(failed.blocked, false);
+  assert.ok(failed.failures.length >= 2);
+  assert.equal(db.runes.getViolationCount(GLOBAL_RUNE_SCOPE, CALLER, 'call'), 4);
+});
+
+test('handler uses rune path for legacy antilink without writing generic warnings', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.updateGroup(GROUP, { antilink: 1, max_warnings: 3 });
+  await handler.processMessage(socket, makeMessage({ id: 'L1', text: 'https://example.com' }));
+  assert.equal(socket.sent[0].content.delete?.id, 'L1');
+  assert.equal(db.countWarnings(GROUP, MEMBER), 0);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 1);
+});
+
+test('admins and allies still bypass rune filters', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'link', { enabled: true, mode: 'exile' });
+  db.addAlly(GROUP, MEMBER, ADMIN);
+  await handler.processMessage(socket, makeMessage({ id: 'L2', text: 'https://example.com' }));
+  assert.equal(socket.sent.length, 0);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 0);
+});
+
+test('ordinary group mentions do not trigger mention rune; status mentions do', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'mention', { enabled: true, mode: 'mercy' });
+  await handler.handleUpsert(socket, {
+    type: 'notify',
+    messages: [
+      {
+        key: { id: 'ORD1', remoteJid: GROUP, participant: MEMBER },
+        message: {
+          extendedTextMessage: {
+            text: '@owner',
+            contextInfo: { mentionedJid: [OWNER] },
+          },
+        },
+      },
+    ],
+  });
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'mention'), 0);
+
+  await handler.handleUpsert(socket, {
+    type: 'append',
+    messages: [
+      {
+        key: { id: 'ST1', remoteJid: GROUP, participant: MEMBER },
+        message: {
+          statusMentionMessage: {
+            message: {
+              extendedTextMessage: {
+                text: 'mentioned',
+                contextInfo: {
+                  remoteJid: 'status@broadcast',
+                  mentionedJid: [OWNER],
+                  stanzaId: 'STATUS-A',
+                },
+              },
+            },
+          },
+        },
+      },
+    ],
+  });
+  assert.ok(socket.sent.some((entry) => /MENTION RUNE/.test(entry.content.text || '')));
+});
+
+test('bot rune crush removes only when criteria match and never duplicates', async (t) => {
+  const { db, socket, handler } = createHarness(t, { botAdmin: true });
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'bot', { enabled: true, mode: 'crush' });
+  handler.joinTracker.record(GROUP, MEMBER, Date.now());
+  const mentions = Array.from({ length: 10 }, (_, index) => `${200 + index}@s.whatsapp.net`);
+  const inviteText = 'join https://chat.whatsapp.com/AbCdEfGhIjK';
+  await handler.processMessage(
+    socket,
+    makeMessage({
+      id: 'BOT1',
+      text: inviteText,
+      message: {
+        extendedTextMessage: {
+          text: inviteText,
+          contextInfo: { mentionedJid: mentions },
+        },
+      },
+    }),
+  );
+  assert.deepEqual(socket.removed, [MEMBER]);
+  await handler.processMessage(
+    socket,
+    makeMessage({
+      id: 'BOT2',
+      text: inviteText,
+      message: {
+        extendedTextMessage: {
+          text: inviteText,
+          contextInfo: { mentionedJid: mentions },
+        },
+      },
+    }),
+  );
+  assert.deepEqual(socket.removed, [MEMBER]);
+});
+
+test('bot rune lockdown command never removes members', async (t) => {
+  const db = freshDb(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  const sock = makeSocket();
+  const { ctx, replies } = runeCtx(db, { sock, args: ['lockdown'] });
+  const botrune = (await import('../commands/security/botrune.js')).default;
+  await botrune.execute(ctx);
+  assert.deepEqual(sock.removed, []);
+  assert.equal(sock.settings[0].setting, 'announcement');
+  assert.match(replies[0].text, /BOT RUNE/);
+  assert.equal(describeRuneSetting(resolveRuneSetting(db, GROUP, 'bot')).includes('LOCKDOWN'), true);
+});
+
+test('call listener is attached once and mercy never blocks through the handler', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.runes.setSetting(GLOBAL_RUNE_SCOPE, 'call', { enabled: true, mode: 'mercy' });
+  const events = [];
+  const live = {
+    ...socket,
+    ev: {
+      on(name, fn) {
+        events.push(name);
+        live[`_${name}`] = fn;
+      },
+      off() {},
+    },
+  };
+  handler.attach(live);
+  assert.equal(events.filter((name) => name === 'call').length, 1);
+  await handler.handleCall(socket, { id: 'H1', from: CALLER, status: 'offer' });
+  assert.deepEqual(socket.rejected, [{ id: 'H1', from: CALLER }]);
+  assert.deepEqual(socket.blocked, []);
+});
+
+test('rune commands require admin in groups and sudo for call rune; reset is scoped', async (t) => {
+  const db = freshDb(t);
+  db.ensureGroup(GROUP, 'Domain');
+  const memberCtx = runeCtx(db, { isAdmin: false, senderJid: MEMBER, args: ['on'] });
+  await assert.rejects(() => executeRuneCommand(memberCtx.ctx, 'link'), CommandError);
+
+  const adminCtx = runeCtx(db, { args: ['grace'] });
+  await executeRuneCommand(adminCtx.ctx, 'link');
+  assert.equal(resolveRuneSetting(db, GROUP, 'link').mode, 'grace');
+  assert.equal(resolveRuneSetting(db, GROUP, 'link').enabled, true);
+
+  db.runes.incrementViolation(GROUP, MEMBER, 'link');
+  db.runes.incrementViolation(GROUP, OTHER, 'link');
+  const resetCtx = runeCtx(db, { args: ['reset'], targetJid: MEMBER });
+  await executeRuneCommand(resetCtx.ctx, 'link');
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 0);
+  assert.equal(db.runes.getViolationCount(GROUP, OTHER, 'link'), 1);
+
+  const publicCall = runeCtx(db, { isAdmin: true, isSudo: false, isOwner: false, args: ['on'] });
+  await assert.rejects(() => executeRuneCommand(publicCall.ctx, 'call'), /Sovereign|operator/);
+  const sudoCall = runeCtx(db, { isSudo: true, args: ['grace'] });
+  await executeRuneCommand(sudoCall.ctx, 'call');
+  assert.equal(resolveRuneSetting(db, GLOBAL_RUNE_SCOPE, 'call').mode, 'grace');
+});
+
+test('generic profanity warnings and lockdown remain independent of runes', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.updateGroup(GROUP, { profanity: 1, max_warnings: 3 });
+  await handler.processMessage(socket, makeMessage({ id: 'P1', text: 'this is a badword' }));
+  assert.equal(db.countWarnings(GROUP, MEMBER), 1);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 0);
+  assert.ok(socket.sent.some((entry) => /JUDGMENT/.test(entry.content.text || '')));
+
+  const lockdown = (await import('../commands/domain/lockdown.js')).default;
+  const { ctx } = runeCtx(db, { sock: socket, args: [] });
+  await lockdown.execute(ctx);
+  assert.equal(socket.settings.at(-1).setting, 'announcement');
+  assert.equal(db.getGroup(GROUP).member_add_mode, 'admin_add');
+});
+
+test('vigil reports rune settings alongside legacy wards', async (t) => {
+  const db = freshDb(t);
+  db.ensureGroup(GROUP, 'Domain');
+  db.updateGroup(GROUP, { antilink: 1, antispam: 0, profanity: 1 });
+  db.runes.setSetting(GROUP, 'mention', { enabled: true, mode: 'mercy' });
+  const vigil = (await import('../commands/security/vigil.js')).default;
+  const { ctx, replies } = runeCtx(db);
+  await vigil.execute(ctx);
+  const text = replies[0].text;
+  assert.match(text, /ANTI-LINK: ACTIVE/);
+  assert.match(text, /LINK RUNE:/);
+  assert.match(text, /SPAM RUNE:/);
+  assert.match(text, /MENTION RUNE: ACTIVE \(MERCY \/ KICK\)/);
+  assert.match(text, /BOT RUNE: DORMANT/);
+  assert.match(text, /PROFANITY WARD: ACTIVE/);
+});

@@ -339,8 +339,9 @@ test('anti-link deletes the offending message and records a warning', async (t) 
     }),
   );
   assert.equal(socket.sent[0].content.delete?.id, 'LINK1');
-  assert.equal(db.countWarnings(GROUP, MEMBER), 1);
-  assert.ok(socket.sent.some((entry) => /JUDGMENT/.test(entry.content.text || '')));
+  assert.equal(db.countWarnings(GROUP, MEMBER), 0);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 1);
+  assert.ok(socket.sent.some((entry) => /LINK RUNE/.test(entry.content.text || '')));
 });
 
 test('admins and allies bypass group security filters', async (t) => {

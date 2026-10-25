@@ -15,6 +15,7 @@ const PRIORITY_COMMANDS = [
   'cleave', 'silence', 'release', 'ascend', 'crush', 'dismantle', 'summon', 'shadowtag', 'converge',
   'condemn', 'pardon', 'domainlink',
   'malevolent', 'profanity', 'overwhelm', 'vigil', 'judgment', 'welcome', 'departure',
+  'linkrune', 'mentionrune', 'spamrune', 'botrune', 'callrune',
   'farewell', 'law', 'doctrine',
   'regime', 'edictor', 'bind', 'unbind', 'mode', 'reawaken', 'alliance', 'absence',
 ];
