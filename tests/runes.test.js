@@ -1106,7 +1106,10 @@ test('link detection covers bare hosts and nested invite payloads', () => {
   assert.equal(detectLink('see wa.me for chat'), true);
   assert.equal(detectLink('join chat.whatsapp.com now'), true);
   assert.equal(detectLink('https://example.com/path'), true);
+  assert.equal(detectLink('http://evil.example/path'), true);
+  assert.equal(detectLink('visit www.example.org/x now'), true);
   assert.equal(detectLink('no urls here'), false);
+  assert.equal(detectLink('mmg.whatsapp.net is not a user link'), false);
   assert.equal(detectInvite({ groupInviteMessage: { groupJid: GROUP } }, ''), true);
   assert.equal(
     detectInvite(
@@ -1124,7 +1127,179 @@ test('link detection covers bare hosts and nested invite payloads', () => {
     true,
   );
   assert.equal(detectLink('', { extendedTextMessage: { text: 'https://evil.example' } }), true);
+  assert.equal(detectLink('', { imageMessage: { caption: 'see https://phish.example' } }), true);
+  assert.equal(
+    detectLink('', { imageMessage: { url: 'https://mmg.whatsapp.net/v/t62/media.jpg', caption: 'photo' } }),
+    false,
+  );
+  assert.equal(
+    detectLink('', { imageMessage: { url: 'https://pps.whatsapp.net/v/t61/avatar.jpg', mimetype: 'image/jpeg' } }),
+    false,
+  );
   assert.equal(detectInvite({}, 'hello'), false);
+});
+
+test('linkrune mercy deletes and warns once without escalating', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'link', { enabled: true, mode: 'mercy', punishment: 'kick' });
+  await handler.processMessage(socket, makeMessage({ id: 'LM1', text: 'https://example.com/one' }));
+  assert.equal(socket.sent[0].content.delete?.id, 'LM1');
+  assert.equal(socket.removed.length, 0);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 0);
+  assert.ok(socket.sent.some((entry) => /single warning/i.test(entry.content.text || '')));
+
+  await handler.processMessage(socket, makeMessage({ id: 'LM2', text: 'https://example.com/two' }));
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'LM2'));
+  assert.equal(socket.removed.length, 0);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 0);
+  assert.equal(socket.sent.filter((entry) => /single warning/i.test(entry.content.text || '')).length, 1);
+});
+
+test('linkrune grace warns three times then applies the configured punishment on the fourth', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'link', { enabled: true, mode: 'grace', punishment: 'kick' });
+  const marks = [];
+  for (let index = 1; index <= 3; index += 1) {
+    await handler.processMessage(socket, makeMessage({ id: `LG${index}`, text: `https://example.com/${index}` }));
+    assert.equal(socket.removed.length, 0);
+    assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), index);
+    marks.push(socket.sent.at(-1).content.text || '');
+  }
+  assert.match(marks[0], /First mark/);
+  assert.match(marks[1], /Second mark/);
+  assert.match(marks[2], /Third mark/);
+  assert.equal(marks.filter((text) => /MARKS: 1\/3/.test(text)).length, 1);
+  assert.equal(marks.filter((text) => /MARKS: 2\/3/.test(text)).length, 1);
+  assert.equal(marks.filter((text) => /MARKS: 3\/3/.test(text)).length, 1);
+
+  await handler.processMessage(socket, makeMessage({ id: 'LG4', text: 'https://example.com/4' }));
+  assert.deepEqual(socket.removed, [MEMBER]);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 0);
+  assert.ok(socket.sent.some((entry) => /VERDICT: KICK/.test(entry.content.text || '')));
+  assert.ok(!socket.sent.some((entry) => /VERDICT: BAN/.test(entry.content.text || '')));
+});
+
+test('linkrune exile deletes and applies the configured punishment immediately', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'link', { enabled: true, mode: 'exile', punishment: 'kick' });
+  await handler.processMessage(socket, makeMessage({ id: 'LE1', text: 'www.evil.example/join' }));
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'LE1'));
+  assert.deepEqual(socket.removed, [MEMBER]);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 0);
+  assert.ok(!socket.sent.some((entry) => /First mark|single warning|MARKS:/.test(entry.content.text || '')));
+  assert.ok(socket.sent.some((entry) => /VERDICT: KICK/.test(entry.content.text || '')));
+});
+
+test('linkrune counters stay independent per user and per rune', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'link', { enabled: true, mode: 'grace' });
+  db.runes.setSetting(GROUP, 'spam', { enabled: true, mode: 'grace' });
+  await handler.processMessage(socket, makeMessage({ id: 'LI1', text: 'https://example.com/a' }));
+  await handler.processMessage(socket, makeMessage({ id: 'LI2', sender: OTHER, text: 'https://example.com/b' }));
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 1);
+  assert.equal(db.runes.getViolationCount(GROUP, OTHER, 'link'), 1);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 0);
+  assert.equal(db.runes.getViolationCount(OTHER_GROUP, MEMBER, 'link'), 0);
+});
+
+test('linkrune identity resolution merges LID and phone aliases of the same member', async (t) => {
+  const lid = '123456789012345@lid';
+  const meta = makeGroupMeta({ extra: [{ id: lid, phoneNumber: MEMBER }] });
+  const { db, socket, handler } = createHarness(t, { groupMeta: meta });
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'link', { enabled: true, mode: 'grace' });
+  await handler.processMessage(socket, makeMessage({ id: 'ID1', sender: lid, text: 'https://example.com/lid' }));
+  await handler.processMessage(socket, makeMessage({ id: 'ID2', sender: MEMBER, text: 'https://example.com/pn' }));
+  const lidCount = db.runes.getViolationCount(GROUP, lid, 'link');
+  const phoneCount = db.runes.getViolationCount(GROUP, MEMBER, 'link');
+  assert.equal(lidCount + phoneCount, 2);
+  assert.ok(lidCount === 0 || phoneCount === 0);
+});
+
+test('linkrune reports failed deletion and failed punishment without claiming success', async (t) => {
+  const { db, socket, handler } = createHarness(t, { socketOptions: { failDelete: true, failKick: true } });
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'link', { enabled: true, mode: 'exile', punishment: 'kick' });
+  await handler.processMessage(socket, makeMessage({ id: 'LF1', text: 'https://example.com/fail' }));
+  assert.deepEqual(socket.removed, []);
+  assert.ok(socket.sent.some((entry) => /FAILED/.test(entry.content.text || '')));
+  assert.ok(socket.sent.some((entry) => /Delete failed/.test(entry.content.text || '')));
+  assert.ok(socket.sent.some((entry) => /Punishment failed/.test(entry.content.text || '')));
+  assert.ok(!socket.sent.some((entry) => /VERDICT: KICK/.test(entry.content.text || '')));
+});
+
+test('linkrune enforcement uses the configured punishment and refuses unknown kinds', async (t) => {
+  const db = freshDb(t);
+  const sock = makeSocket();
+  const unknown = await enforceRuneViolation({
+    db,
+    sock,
+    logger,
+    rune: 'link',
+    scope: GROUP,
+    chatJid: GROUP,
+    userJid: MEMBER,
+    mode: 'exile',
+    punishment: 'ban',
+    groupMeta: makeGroupMeta(),
+    botJid: BOT,
+    deleteOffending: false,
+  });
+  assert.equal(unknown.punished, false);
+  assert.deepEqual(sock.removed, []);
+  assert.ok(unknown.failures.some((entry) => /Unsupported punishment "ban"/.test(entry)));
+  assert.ok(sock.sent.some((entry) => /FAILED/.test(entry.content.text || '')));
+
+  const kicked = await enforceRuneViolation({
+    db,
+    sock,
+    logger,
+    rune: 'link',
+    scope: GROUP,
+    chatJid: GROUP,
+    userJid: MEMBER,
+    mode: 'exile',
+    punishment: 'kick',
+    groupMeta: makeGroupMeta(),
+    botJid: BOT,
+    deleteOffending: false,
+  });
+  assert.equal(kicked.punished, true);
+  assert.deepEqual(sock.removed, [MEMBER]);
+});
+
+test('linkrune command modes, alias, help and admin permission work', async (t) => {
+  const db = freshDb(t);
+  db.ensureGroup(GROUP, 'Domain');
+  const member = runeCtx(db, { isAdmin: false, senderJid: MEMBER, args: ['on'] });
+  await assert.rejects(() => executeRuneCommand(member.ctx, 'link'), CommandError);
+
+  for (const mode of ['mercy', 'grace', 'exile']) {
+    const admin = runeCtx(db, { args: [mode] });
+    await executeRuneCommand(admin.ctx, 'link');
+    const setting = resolveRuneSetting(db, GROUP, 'link');
+    assert.equal(setting.enabled, true);
+    assert.equal(setting.mode, mode);
+    assert.equal(setting.punishment, 'kick');
+  }
+
+  const help = runeCtx(db, { args: ['help'] });
+  await executeRuneCommand(help.ctx, 'link');
+  const helpText = help.replies[0].text;
+  assert.match(helpText, /mercy\|grace\|exile/);
+  assert.match(helpText, /Mercy deletes the link and warns once/);
+  assert.match(helpText, /Grace warns on violations 1, 2 and 3/);
+  assert.match(helpText, /Exile deletes the link and applies the configured punishment immediately/);
+
+  const loaded = await loadCommands(path.join(path.resolve(import.meta.dirname, '..'), 'commands'), logger);
+  const command = loaded.get('linkrune');
+  assert.equal(command.aliases.includes('linkward'), true);
+  assert.equal(loaded.get('linkward'), command);
+  assert.equal(command.permissions.includes('admin'), true);
 });
 
 test('call rune does not pretend a LID block succeeded without phone mapping', async (t) => {
