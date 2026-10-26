@@ -5,7 +5,7 @@ export default {
   aliases: ['callward'],
   description: 'Configure the Call Rune against private calls to the vessel.',
   category: 'atlas-rune',
-  usage: 'callrune [on|off|mercy|grace|reset @user|status|help]',
+  usage: 'callrune [on|off|mercy|grace|exile|reset @user|status|help]',
   permissions: ['sudo'],
   cooldownMs: 2000,
   async execute(ctx) {

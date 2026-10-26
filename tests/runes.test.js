@@ -671,8 +671,146 @@ test('call mercy rejects without blocking; grace blocks only on the fourth quali
     callEvent: { id: 'G4', from: CALLER, status: 'offer' },
   });
   assert.equal(fourth.blocked, true);
+  assert.equal(fourth.warned, false);
+  assert.equal(fourth.mode, 'grace');
   assert.deepEqual(graceSock.blocked, [{ jid: CALLER, action: 'block' }]);
   assert.equal(db.runes.getViolationCount(GLOBAL_RUNE_SCOPE, CALLER, 'call'), 0);
+
+  const texts = graceSock.sent.map((entry) => entry.content.text || '');
+  assert.equal(texts.filter((text) => /First mark/.test(text)).length, 1);
+  assert.equal(texts.filter((text) => /Second mark/.test(text)).length, 1);
+  assert.equal(texts.filter((text) => /Third mark/.test(text)).length, 1);
+  assert.ok(texts.some((text) => /fourth call is the last/i.test(text)));
+});
+
+test('call exile rejects and blocks on the first violation without a preliminary warning', async (t) => {
+  const db = freshDb(t);
+  db.runes.setSetting(GLOBAL_RUNE_SCOPE, 'call', { enabled: true, mode: 'exile' });
+  const sock = makeSocket();
+  const result = await handleCallRune({
+    db,
+    sock,
+    logger,
+    ownerJid: OWNER,
+    botJid: BOT,
+    callEvent: { id: 'E1', from: CALLER, status: 'offer' },
+  });
+  assert.equal(result.skipped, false);
+  assert.equal(result.rejected, true);
+  assert.equal(result.blocked, true);
+  assert.equal(result.warned, false);
+  assert.equal(result.mode, 'exile');
+  assert.deepEqual(sock.rejected, [{ id: 'E1', from: CALLER }]);
+  assert.deepEqual(sock.blocked, [{ jid: CALLER, action: 'block' }]);
+  assert.equal(db.runes.getViolationCount(GLOBAL_RUNE_SCOPE, CALLER, 'call'), 0);
+  assert.ok(!sock.sent.some((entry) => /MARKS:/.test(entry.content.text || '')));
+  assert.ok(!sock.sent.some((entry) => /First mark/.test(entry.content.text || '')));
+  assert.ok(sock.sent.some((entry) => /first call is the last/i.test(entry.content.text || '')));
+
+  const duplicate = await handleCallRune({
+    db,
+    sock,
+    logger,
+    ownerJid: OWNER,
+    botJid: BOT,
+    callEvent: { id: 'E1', from: CALLER, status: 'offer' },
+  });
+  assert.equal(duplicate.skipped, true);
+  assert.equal(duplicate.reason, 'duplicate');
+  assert.equal(sock.blocked.length, 1);
+});
+
+test('call rune counters are independent per caller and isolated from other runes', async (t) => {
+  const db = freshDb(t);
+  db.runes.setSetting(GLOBAL_RUNE_SCOPE, 'call', { enabled: true, mode: 'grace' });
+  db.runes.setSetting(GROUP, 'link', { enabled: true, mode: 'grace' });
+  db.runes.incrementViolation(GROUP, CALLER, 'link');
+  db.runes.incrementViolation(GROUP, CALLER, 'link');
+  db.runes.incrementViolation(GROUP, CALLER, 'link');
+  const sock = makeSocket();
+  const first = await handleCallRune({
+    db,
+    sock,
+    logger,
+    ownerJid: OWNER,
+    botJid: BOT,
+    callEvent: { id: 'I1', from: CALLER, status: 'offer' },
+  });
+  assert.equal(first.count, 1);
+  assert.equal(first.blocked, false);
+  const other = await handleCallRune({
+    db,
+    sock,
+    logger,
+    ownerJid: OWNER,
+    botJid: BOT,
+    callEvent: { id: 'I2', from: OTHER, status: 'offer' },
+  });
+  assert.equal(other.count, 1);
+  assert.equal(other.blocked, false);
+  assert.equal(db.runes.getViolationCount(GLOBAL_RUNE_SCOPE, CALLER, 'call'), 1);
+  assert.equal(db.runes.getViolationCount(GLOBAL_RUNE_SCOPE, OTHER, 'call'), 1);
+  assert.equal(db.runes.getViolationCount(GROUP, CALLER, 'link'), 3);
+
+  for (let index = 2; index <= 4; index += 1) {
+    await handleCallRune({
+      db,
+      sock,
+      logger,
+      ownerJid: OWNER,
+      botJid: BOT,
+      callEvent: { id: `I1-${index}`, from: CALLER, status: 'offer' },
+    });
+  }
+  assert.equal(db.runes.getViolationCount(GLOBAL_RUNE_SCOPE, CALLER, 'call'), 0);
+  assert.equal(db.runes.getViolationCount(GLOBAL_RUNE_SCOPE, OTHER, 'call'), 1);
+  assert.deepEqual(sock.blocked, [{ jid: CALLER, action: 'block' }]);
+});
+
+test('call rune uses callerPn for LID identity and does not block in mercy after repeats', async (t) => {
+  const db = freshDb(t);
+  db.runes.setSetting(GLOBAL_RUNE_SCOPE, 'call', { enabled: true, mode: 'mercy' });
+  const sock = makeSocket();
+  const lid = '777@lid';
+  const first = await handleCallRune({
+    db,
+    sock,
+    logger,
+    ownerJid: OWNER,
+    botJid: BOT,
+    callEvent: { id: 'PN1', from: lid, callerPn: CALLER, status: 'offer' },
+  });
+  assert.equal(first.rejected, true);
+  assert.equal(first.blocked, false);
+  assert.equal(first.warned, true);
+  const second = await handleCallRune({
+    db,
+    sock,
+    logger,
+    ownerJid: OWNER,
+    botJid: BOT,
+    callEvent: { id: 'PN2', from: lid, callerPn: CALLER, status: 'offer' },
+  });
+  assert.equal(second.rejected, true);
+  assert.equal(second.blocked, false);
+  assert.equal(second.warned, false);
+  assert.deepEqual(sock.blocked, []);
+  assert.equal(db.runes.getViolationCount(GLOBAL_RUNE_SCOPE, CALLER, 'call'), 0);
+  assert.equal(db.runes.getViolationCount(GLOBAL_RUNE_SCOPE, lid, 'call'), 0);
+
+  db.runes.setSetting(GLOBAL_RUNE_SCOPE, 'call', { enabled: true, mode: 'exile' });
+  const exileSock = makeSocket();
+  const exile = await handleCallRune({
+    db,
+    sock: exileSock,
+    logger,
+    ownerJid: OWNER,
+    botJid: BOT,
+    callEvent: { id: 'PN3', from: lid, callerPn: CALLER, status: 'offer' },
+  });
+  assert.equal(exile.blocked, true);
+  assert.equal(exile.warned, false);
+  assert.deepEqual(exileSock.blocked, [{ jid: CALLER, action: 'block' }]);
 });
 
 test('call rune ignores group calls, owner/sudo callers, and failed reject/block APIs', async (t) => {
@@ -725,6 +863,24 @@ test('call rune ignores group calls, owner/sudo callers, and failed reject/block
   assert.equal(failed.blocked, false);
   assert.ok(failed.failures.length >= 2);
   assert.equal(db.runes.getViolationCount(GLOBAL_RUNE_SCOPE, CALLER, 'call'), 4);
+
+  const exileFailSock = makeSocket(makeGroupMeta(), { failReject: true, failBlock: true });
+  db.runes.setSetting(GLOBAL_RUNE_SCOPE, 'call', { enabled: true, mode: 'exile' });
+  const exileFailed = await handleCallRune({
+    db,
+    sock: exileFailSock,
+    logger,
+    ownerJid: OWNER,
+    botJid: BOT,
+    callEvent: { id: 'EF1', from: OTHER, status: 'offer' },
+  });
+  assert.equal(exileFailed.rejected, false);
+  assert.equal(exileFailed.blocked, false);
+  assert.equal(exileFailed.warned, false);
+  assert.ok(exileFailed.failures.some((entry) => /Reject failed/i.test(entry)));
+  assert.ok(exileFailed.failures.some((entry) => /Block failed/i.test(entry)));
+  assert.deepEqual(exileFailSock.blocked, []);
+  assert.equal(db.runes.getViolationCount(GLOBAL_RUNE_SCOPE, OTHER, 'call'), 1);
 });
 
 test('spam rune fires once at threshold and does not write generic warnings', async (t) => {
@@ -864,7 +1020,7 @@ test('bot rune lockdown command never removes members', async (t) => {
   db.ensureGroup(GROUP, 'Test Domain');
   const sock = makeSocket();
   const { ctx, replies } = runeCtx(db, { sock, args: ['lockdown'] });
-  const botrune = (await import('../commands/security/botrune.js')).default;
+  const botrune = (await import('../commands/atlas-rune/botrune.js')).default;
   await botrune.execute(ctx);
   assert.deepEqual(sock.removed, []);
   assert.equal(sock.settings[0].setting, 'announcement');
@@ -916,6 +1072,18 @@ test('rune commands require admin in groups and sudo for call rune; reset is sco
   const sudoCall = runeCtx(db, { isSudo: true, args: ['grace'] });
   await executeRuneCommand(sudoCall.ctx, 'call');
   assert.equal(resolveRuneSetting(db, GLOBAL_RUNE_SCOPE, 'call').mode, 'grace');
+
+  const exileCall = runeCtx(db, { isSudo: true, args: ['exile'] });
+  await executeRuneCommand(exileCall.ctx, 'call');
+  assert.equal(resolveRuneSetting(db, GLOBAL_RUNE_SCOPE, 'call').mode, 'exile');
+  assert.equal(resolveRuneSetting(db, GLOBAL_RUNE_SCOPE, 'call').enabled, true);
+
+  const helpCall = runeCtx(db, { isSudo: true, args: ['help'] });
+  await executeRuneCommand(helpCall.ctx, 'call');
+  const helpText = helpCall.replies[0].text;
+  assert.match(helpText, /mercy\|grace\|exile/);
+  assert.match(helpText, /Exile blocks immediately/);
+  assert.doesNotMatch(helpText, /has no Exile mode/);
 });
 
 test('generic profanity warnings and lockdown remain independent of runes', async (t) => {
