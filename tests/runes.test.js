@@ -21,12 +21,15 @@ import {
   classifyCall,
   createJoinTracker,
   crushSignals,
+  canDeleteIncomingContent,
+  detectGroupMention,
   detectInvite,
   detectLink,
   enforceRuneViolation,
   handleCallRune,
   isExemptFromRunes,
   isStatusMentionOfTarget,
+  STATUS_DELETION_UNSUPPORTED,
 } from '../lib/rune-engine.js';
 import { executeRuneCommand } from '../lib/rune-commands.js';
 import { loadCommands } from '../lib/registry.js';
@@ -941,7 +944,79 @@ test('admins and allies still bypass rune filters', async (t) => {
   assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 0);
 });
 
-test('ordinary group mentions do not trigger mention rune; status mentions do', async (t) => {
+function groupMentionMessage({
+  id = 'GM1',
+  chat = GROUP,
+  sender = MEMBER,
+  groupJid = GROUP,
+  text = 'check this group',
+  fromMe = false,
+} = {}) {
+  return {
+    key: { id, remoteJid: chat, fromMe, participant: sender },
+    message: {
+      extendedTextMessage: {
+        text,
+        contextInfo: {
+          groupMentions: [{ groupJid, groupSubject: 'Test Domain' }],
+        },
+      },
+    },
+  };
+}
+
+test('genuine group mentions are detected; individual mentions and group-name text are not', () => {
+  const genuine = {
+    extendedTextMessage: {
+      text: 'see this',
+      contextInfo: { groupMentions: [{ groupJid: GROUP, groupSubject: 'Test Domain' }] },
+    },
+  };
+  const hit = detectGroupMention(genuine);
+  assert.equal(hit.ok, true);
+  assert.deepEqual(hit.groupJids, [GROUP]);
+
+  const individual = {
+    extendedTextMessage: {
+      text: '@owner hello',
+      contextInfo: { mentionedJid: [OWNER] },
+    },
+  };
+  assert.equal(detectGroupMention(individual).ok, false);
+
+  const nameOnly = { conversation: 'join Test Domain later' };
+  assert.equal(detectGroupMention(nameOnly).ok, false);
+
+  const invite = { conversation: 'https://chat.whatsapp.com/AbCdEfGhIjK' };
+  assert.equal(detectGroupMention(invite).ok, false);
+
+  const wrapped = {
+    groupMentionedMessage: {
+      message: {
+        extendedTextMessage: {
+          text: 'mentioned the group',
+          contextInfo: { groupMentions: [{ groupJid: GROUP }] },
+        },
+      },
+    },
+  };
+  const wrappedHit = detectGroupMention(wrapped);
+  assert.equal(wrappedHit.ok, true);
+  assert.equal(wrappedHit.viaWrapper, true);
+  assert.deepEqual(wrappedHit.groupJids, [GROUP]);
+});
+
+test('status broadcast messages cannot be deleted for everyone', () => {
+  const statusMsg = {
+    key: { id: 'ST-DEL', remoteJid: 'status@broadcast', participant: MEMBER },
+    message: { conversation: 'status' },
+  };
+  assert.equal(canDeleteIncomingContent(statusMsg), false);
+  assert.match(STATUS_DELETION_UNSUPPORTED, /does not permit deleting another person's Status/i);
+  assert.equal(canDeleteIncomingContent(makeMessage({ id: 'G1' })), true);
+});
+
+test('ordinary group mentions do not trigger mention rune; genuine group mentions do', async (t) => {
   const { db, socket, handler } = createHarness(t);
   db.ensureGroup(GROUP, 'Test Domain');
   db.runes.setSetting(GROUP, 'mention', { enabled: true, mode: 'mercy' });
@@ -960,29 +1035,13 @@ test('ordinary group mentions do not trigger mention rune; status mentions do', 
     ],
   });
   assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'mention'), 0);
+  assert.equal(socket.sent.length, 0);
 
   await handler.handleUpsert(socket, {
-    type: 'append',
-    messages: [
-      {
-        key: { id: 'ST1', remoteJid: GROUP, participant: MEMBER },
-        message: {
-          statusMentionMessage: {
-            message: {
-              extendedTextMessage: {
-                text: 'mentioned',
-                contextInfo: {
-                  remoteJid: 'status@broadcast',
-                  mentionedJid: [OWNER],
-                  stanzaId: 'STATUS-A',
-                },
-              },
-            },
-          },
-        },
-      },
-    ],
+    type: 'notify',
+    messages: [groupMentionMessage({ id: 'GM1' })],
   });
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'GM1'));
   assert.ok(socket.sent.some((entry) => /MENTION RUNE/.test(entry.content.text || '')));
 });
 
@@ -1642,6 +1701,225 @@ test('join tracker matches LID and phone aliases of the same joiner', () => {
   assert.equal(tracker.get(GROUP, MEMBER), now);
   assert.equal(tracker.get(GROUP, lid), now);
   assert.equal(tracker.get(GROUP, OTHER), null);
+});
+
+test('mentionrune mercy deletes a genuine group mention and warns once', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'mention', { enabled: true, mode: 'mercy' });
+  await handler.handleUpsert(socket, {
+    type: 'notify',
+    messages: [groupMentionMessage({ id: 'MM1' })],
+  });
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'MM1'));
+  assert.equal(socket.removed.length, 0);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'mention'), 0);
+  assert.ok(socket.sent.some((entry) => /single warning/i.test(entry.content.text || '')));
+
+  await handler.handleUpsert(socket, {
+    type: 'notify',
+    messages: [groupMentionMessage({ id: 'MM2' })],
+  });
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'MM2'));
+  assert.equal(socket.removed.length, 0);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'mention'), 0);
+  assert.equal(socket.sent.filter((entry) => /single warning/i.test(entry.content.text || '')).length, 1);
+});
+
+test('mentionrune grace warns three times then kicks on the fourth group mention', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'mention', { enabled: true, mode: 'grace' });
+  for (let index = 1; index <= 3; index += 1) {
+    await handler.handleUpsert(socket, {
+      type: 'notify',
+      messages: [groupMentionMessage({ id: `MG${index}` })],
+    });
+    assert.equal(socket.removed.length, 0);
+    assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'mention'), index);
+  }
+  await handler.handleUpsert(socket, {
+    type: 'notify',
+    messages: [groupMentionMessage({ id: 'MG4' })],
+  });
+  assert.deepEqual(socket.removed, [MEMBER]);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'mention'), 0);
+  assert.ok(socket.sent.some((entry) => /VERDICT: KICK/.test(entry.content.text || '')));
+});
+
+test('mentionrune exile deletes and kicks immediately', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'mention', { enabled: true, mode: 'exile' });
+  await handler.handleUpsert(socket, {
+    type: 'notify',
+    messages: [groupMentionMessage({ id: 'ME1' })],
+  });
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'ME1'));
+  assert.deepEqual(socket.removed, [MEMBER]);
+  assert.ok(socket.sent.some((entry) => /VERDICT: KICK/.test(entry.content.text || '')));
+});
+
+test('mentionrune ignores group-name text, individual mentions and invite links', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'mention', { enabled: true, mode: 'exile' });
+  db.runes.setSetting(GROUP, 'link', { enabled: false });
+
+  await handler.handleUpsert(socket, {
+    type: 'notify',
+    messages: [makeMessage({ id: 'NAME1', text: 'Test Domain is great' })],
+  });
+  await handler.handleUpsert(socket, {
+    type: 'notify',
+    messages: [{
+      key: { id: 'IND1', remoteJid: GROUP, participant: MEMBER },
+      message: {
+        extendedTextMessage: {
+          text: `@${OWNER.split('@')[0]}`,
+          contextInfo: { mentionedJid: [OWNER] },
+        },
+      },
+    }],
+  });
+  await handler.handleUpsert(socket, {
+    type: 'notify',
+    messages: [makeMessage({ id: 'INV1', text: 'https://chat.whatsapp.com/AbCdEfGhIjK' })],
+  });
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'mention'), 0);
+  assert.deepEqual(socket.removed, []);
+  assert.ok(!socket.sent.some((entry) => entry.content.delete));
+});
+
+test('mentionrune duplicate events are claimed once', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'mention', { enabled: true, mode: 'grace' });
+  const live = groupMentionMessage({ id: 'DUP-M' });
+  await handler.handleUpsert(socket, { type: 'notify', messages: [live] });
+  const afterFirst = db.runes.getViolationCount(GROUP, MEMBER, 'mention');
+  await handler.handleUpsert(socket, { type: 'notify', messages: [live] });
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'mention'), afterFirst);
+});
+
+test('mentionrune identifies sender and mentioned group, including LID aliases', async (t) => {
+  const lid = '123456789012345@lid';
+  const meta = makeGroupMeta({ extra: [{ id: lid, phoneNumber: MEMBER }] });
+  const { db, socket, handler } = createHarness(t, { groupMeta: meta });
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'mention', { enabled: true, mode: 'grace' });
+  await handler.handleUpsert(socket, {
+    type: 'notify',
+    messages: [groupMentionMessage({ id: 'MID1', sender: lid, groupJid: GROUP })],
+  });
+  const lidCount = db.runes.getViolationCount(GROUP, lid, 'mention');
+  const phoneCount = db.runes.getViolationCount(GROUP, MEMBER, 'mention');
+  assert.equal(lidCount + phoneCount, 1);
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'MID1'));
+});
+
+test('mentionrune still enforces for ordinary members under covenant and veil', async (t) => {
+  for (const mode of ['covenant', 'veil']) {
+    let executed = 0;
+    const { db, socket, handler } = createHarness(t);
+    const echo = {
+      name: 'echo',
+      aliases: [],
+      permissions: ['public'],
+      cooldownMs: 0,
+      async execute() {
+        executed += 1;
+      },
+    };
+    handler.registry = {
+      get: (name) => (name === 'echo' ? echo : null),
+      size: 1,
+      all: () => [echo],
+      categories: () => [],
+    };
+    db.setSetting('access_mode', mode);
+    db.ensureGroup(GROUP, 'Test Domain');
+    db.runes.setSetting(GROUP, 'mention', { enabled: true, mode: 'grace' });
+    await handler.handleUpsert(socket, {
+      type: 'notify',
+      messages: [groupMentionMessage({ id: `MM-${mode}` })],
+    });
+    assert.ok(socket.sent.some((entry) => entry.content.delete?.id === `MM-${mode}`), mode);
+    assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'mention'), 1, mode);
+    assert.equal(db.getUser(MEMBER), null, mode);
+
+    const sentAfter = socket.sent.length;
+    await handler.processMessage(socket, makeMessage({ id: `MCMD-${mode}`, text: '!echo hello' }));
+    assert.equal(executed, 0, mode);
+    assert.equal(socket.sent.length, sentAfter, mode);
+  }
+});
+
+test('mentionrune reports failed deletion and failed punishment without claiming success', async (t) => {
+  const { db, socket, handler } = createHarness(t, { socketOptions: { failDelete: true, failKick: true } });
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'mention', { enabled: true, mode: 'exile' });
+  await handler.handleUpsert(socket, {
+    type: 'notify',
+    messages: [groupMentionMessage({ id: 'MF1' })],
+  });
+  assert.deepEqual(socket.removed, []);
+  assert.ok(socket.sent.some((entry) => /FAILED/.test(entry.content.text || '')));
+  assert.ok(socket.sent.some((entry) => /Delete failed/.test(entry.content.text || '')));
+  assert.ok(socket.sent.some((entry) => /Punishment failed/.test(entry.content.text || '')));
+  assert.ok(!socket.sent.some((entry) => /VERDICT: KICK/.test(entry.content.text || '')));
+});
+
+test('mentionrune detects Status group mentions but does not claim Status deletion', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'mention', { enabled: true, mode: 'mercy' });
+  await handler.handleUpsert(socket, {
+    type: 'append',
+    messages: [{
+      key: { id: 'STG1', remoteJid: 'status@broadcast', participant: MEMBER, fromMe: false },
+      message: {
+        extendedTextMessage: {
+          text: 'status mention of group',
+          contextInfo: {
+            groupMentions: [{ groupJid: GROUP, groupSubject: 'Test Domain' }],
+          },
+        },
+      },
+    }],
+  });
+  assert.ok(!socket.sent.some((entry) => entry.content.delete));
+  assert.ok(socket.sent.some((entry) => /does not permit deleting another person's Status/i.test(entry.content.text || '')));
+  assert.ok(socket.sent.some((entry) => /MENTION RUNE/.test(entry.content.text || '')));
+  assert.equal(socket.removed.length, 0);
+});
+
+test('mentionrune command modes, alias, help and admin permission work', async (t) => {
+  const db = freshDb(t);
+  db.ensureGroup(GROUP, 'Domain');
+  const member = runeCtx(db, { isAdmin: false, senderJid: MEMBER, args: ['on'] });
+  await assert.rejects(() => executeRuneCommand(member.ctx, 'mention'), CommandError);
+
+  for (const mode of ['mercy', 'grace', 'exile']) {
+    const admin = runeCtx(db, { args: [mode] });
+    await executeRuneCommand(admin.ctx, 'mention');
+    const setting = resolveRuneSetting(db, GROUP, 'mention');
+    assert.equal(setting.enabled, true);
+    assert.equal(setting.mode, mode);
+  }
+
+  const help = runeCtx(db, { args: ['help'] });
+  await executeRuneCommand(help.ctx, 'mention');
+  const helpText = help.replies[0].text;
+  assert.match(helpText, /mercy\|grace\|exile/);
+  assert.match(helpText, /Genuine WhatsApp group mentions/);
+  assert.match(helpText, /does not permit deleting another person's Status/);
+
+  const loaded = await loadCommands(path.join(path.resolve(import.meta.dirname, '..'), 'commands'), logger);
+  const command = loaded.get('mentionrune');
+  assert.equal(command.aliases.includes('statusrune'), true);
+  assert.equal(loaded.get('statusrune'), command);
+  assert.equal(command.permissions.includes('admin'), true);
 });
 
 test('unauthorized users cannot alter mention rune; owner may configure it in DM', async (t) => {

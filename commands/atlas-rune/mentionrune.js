@@ -3,7 +3,7 @@ import { executeRuneCommand } from '../../lib/rune-commands.js';
 export default {
   name: 'mentionrune',
   aliases: ['statusrune'],
-  description: 'Configure the Mention Rune against status mentions of the Sovereign.',
+  description: 'Configure the Mention Rune against mentions of a protected group.',
   category: 'atlas-rune',
   usage: 'mentionrune [on|off|mercy|grace|exile|reset @user|status|help]',
   permissions: ['admin'],

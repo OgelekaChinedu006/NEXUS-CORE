@@ -25,11 +25,13 @@ import {
   createPrefixFloodTracker,
   crushSignals,
   detectKnownBotPrefix,
+  canDeleteIncomingContent,
+  detectGroupMention,
   detectLink,
   enforceRuneViolation,
   handleCallRune,
   isExemptFromRunes,
-  isStatusMentionOfTarget,
+  STATUS_DELETION_UNSUPPORTED,
 } from '../lib/rune-engine.js';
 import { GLOBAL_RUNE_SCOPE, resolveRuneSetting } from '../lib/runes.js';
 
@@ -142,6 +144,62 @@ export function extractTargets({ message, text = '', mentions = [] }) {
 
 export function resolvePrefix({ group, db, config }) {
   return group?.prefix || db.getSetting('prefix', config.prefix) || config.prefix;
+}
+
+export function resolveSenderJid(msg, { isGroup = false } = {}) {
+  const key = msg?.key || {};
+  return normalizeJid(
+    key.participant
+      || key.participantAlt
+      || key.participantPn
+      || key.senderPn
+      || (isGroup ? null : key.remoteJid),
+  );
+}
+
+const RECENT_MESSAGE_MAX_AGE_MS = 5 * 60 * 1000;
+
+export function isRecentMessage(msg, { now = Date.now(), maxAgeMs = RECENT_MESSAGE_MAX_AGE_MS } = {}) {
+  const raw = msg?.messageTimestamp;
+  if (raw == null) return true;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return true;
+  const ts = value > 1e12 ? value : value * 1000;
+  return now - ts <= maxAgeMs;
+}
+
+function isMessageEditProtocol(protocol) {
+  if (!protocol) return false;
+  const type = protocol.type;
+  return type === 'MESSAGE_EDIT' || type === 14;
+}
+
+export function resolveIncomingContent(message) {
+  const unwrapped = unwrapMessage(message);
+  if (!unwrapped) return unwrapped;
+  const protocol = unwrapped.protocolMessage;
+  if (isMessageEditProtocol(protocol) && protocol.editedMessage) {
+    return unwrapMessage(protocol.editedMessage);
+  }
+  return unwrapped;
+}
+
+function moderationTargetMessage(msg) {
+  const unwrapped = unwrapMessage(msg?.message);
+  const protocol = unwrapped?.protocolMessage;
+  if (isMessageEditProtocol(protocol) && protocol.key) {
+    return { ...msg, key: protocol.key, message: protocol.editedMessage || msg.message };
+  }
+  return msg;
+}
+
+function resolveMentionRuneSetting(db, groupJid) {
+  let setting = resolveRuneSetting(db, groupJid, 'mention');
+  if (setting.source === 'default') {
+    const globalSetting = resolveRuneSetting(db, GLOBAL_RUNE_SCOPE, 'mention');
+    if (globalSetting.source === 'rune') setting = globalSetting;
+  }
+  return setting;
 }
 
 export function createHandler({ config, db, logger, registry, connection, services = {}, games }) {
@@ -304,19 +362,12 @@ class MessageHandler {
     if (!Array.isArray(messages)) return;
     for (const message of messages) {
       try {
-        const mentionHit = isStatusMentionOfTarget(message, {
-          ownerJid: this.config.ownerJid,
-          botJid: normalizeJid(socket.user?.id),
-          extraJids: sessionIdentityJids(socket.user),
-        });
-        if (mentionHit.ok) {
-          await this.handleStatusMention(socket, message, mentionHit);
-        }
         if (isStatusBroadcastJid(message?.key?.remoteJid)) {
           this.statusCache.observe(message);
+          await this.handleStatusGroupMention(socket, message);
           continue;
         }
-        if (type !== 'notify') continue;
+        if (type !== 'notify' && !(type === 'append' && isRecentMessage(message))) continue;
         await this.processMessage(socket, message);
       } catch (error) {
         this.logger.error(`Message processing failure: ${error.message}`);
@@ -335,41 +386,42 @@ class MessageHandler {
     });
   }
 
-  async handleStatusMention(socket, msg, mentionHit) {
-    const keyRemote = msg?.key?.remoteJid;
-    const chatJid = isStatusBroadcastJid(keyRemote)
-      ? (mentionHit.remoteJid && !isStatusBroadcastJid(mentionHit.remoteJid) ? mentionHit.remoteJid : null)
-      : keyRemote;
-    if (!chatJid || isStatusBroadcastJid(chatJid)) return;
-    const isGroup = isJidGroup(chatJid);
-    const senderJid = normalizeJid(
-      mentionHit.participant || msg.key?.participant || (isGroup ? null : chatJid),
-    );
+  async handleStatusGroupMention(socket, msg) {
+    const hit = detectGroupMention(msg.message);
+    if (!hit.ok) return;
+    const mentioned = hit.groupJids;
+    if (!mentioned.length) return;
+
+    let setting = null;
+    let protectedGroup = null;
+    for (const gid of mentioned) {
+      const candidate = resolveMentionRuneSetting(this.db, gid);
+      if (candidate.enabled) {
+        setting = candidate;
+        protectedGroup = gid;
+        break;
+      }
+    }
+    if (!setting?.enabled || !protectedGroup) return;
+
+    const senderJid = resolveSenderJid(msg, { isGroup: true })
+      || normalizeJid(msg.key?.participant);
     if (!senderJid) return;
 
-    const groupMeta = isGroup ? await this.getGroupMetadata(socket, chatJid) : null;
-    if (isGroup) this.db.ensureGroup(chatJid, groupMeta?.subject || null);
-    let setting = resolveRuneSetting(this.db, chatJid, 'mention');
-    if (setting.source === 'default') {
-      const globalSetting = resolveRuneSetting(this.db, GLOBAL_RUNE_SCOPE, 'mention');
-      if (globalSetting.source === 'rune') setting = globalSetting;
-    }
-    if (!setting.enabled) return;
-
+    const groupMeta = await this.getGroupMetadata(socket, protectedGroup);
+    this.db.ensureGroup(protectedGroup, groupMeta?.subject || null);
     const botJid = normalizeJid(socket.user?.id);
     const senderIds = identityJids(groupMeta, senderJid);
-    const isOwner = Boolean(
-      this.config.ownerJid && senderIds.includes(this.config.ownerJid),
-    );
+    const isOwner = Boolean(this.config.ownerJid && senderIds.includes(this.config.ownerJid));
     const isSudo = senderIds.some((id) => this.db.isOperator(id));
-    const isAdmin = isGroup ? isGroupAdmin(groupMeta, senderJid) : false;
-    const isAlly = isGroup ? senderIds.some((id) => this.db.isAlly(chatJid, id)) : false;
+    const isAdmin = isGroupAdmin(groupMeta, senderJid);
+    const isAlly = senderIds.some((id) => this.db.isAlly(protectedGroup, id));
     if (isExemptFromRunes({
       senderJid,
       botJid,
       ownerJid: this.config.ownerJid,
       groupMeta,
-      groupJid: isGroup ? chatJid : null,
+      groupJid: protectedGroup,
       db: this.db,
       isOwner,
       isSudo,
@@ -377,8 +429,12 @@ class MessageHandler {
       isAlly,
     })) return;
 
-    const eventId = `mention:${mentionHit.eventId}`;
+    const eventId = `mention:status:${msg.key?.id || hit.mentionedGroupJid || protectedGroup}`;
     if (!this.db.runes.claimEvent(eventId, 'mention')) return;
+
+    this.logger.warn(
+      `Mention Rune detected a Status mention of ${protectedGroup}; ${STATUS_DELETION_UNSUPPORTED}`,
+    );
 
     await enforceRuneViolation({
       db: this.db,
@@ -386,14 +442,15 @@ class MessageHandler {
       logger: this.logger,
       rune: 'mention',
       scope: setting.scope,
-      chatJid,
+      chatJid: protectedGroup,
       userJid: senderJid,
       mode: setting.mode,
       punishment: setting.punishment,
       msg,
       groupMeta,
       botJid,
-      deleteOffending: Boolean(isGroup && msg?.key),
+      deleteOffending: false,
+      extraLines: [STATUS_DELETION_UNSUPPORTED],
     });
   }
 
@@ -424,7 +481,7 @@ class MessageHandler {
     const isGroup = isJidGroup(chatJid);
     const senderJid = fromLinkedOwner
       ? ownerJid
-      : normalizeJid(key.participant || (isGroup ? null : chatJid));
+      : resolveSenderJid(msg, { isGroup });
     if (!senderJid) return;
     if (!fromLinkedOwner && botJid && senderJid === botJid) return;
 
@@ -447,10 +504,11 @@ class MessageHandler {
       ? this.db.ensureGroup(chatJid, groupMeta?.subject || null)
       : null;
 
-    const text = getMessageText(msg.message);
+    const resolved = resolveIncomingContent(msg.message);
+    const text = getMessageText(resolved);
     const prefix = resolvePrefix({ group, db: this.db, config: this.config });
     const parsed = parseCommand(text, prefix);
-    const mentions = getContextInfo(msg.message)?.mentionedJid || [];
+    const mentions = getContextInfo(resolved)?.mentionedJid || [];
     const targets = extractTargets({ message: msg.message, text: parsed?.argsText || text, mentions });
     const targetJid = targets[0] || null;
 
@@ -837,16 +895,42 @@ class MessageHandler {
       });
     }
 
-    if (isCommand) return false;
+    const unwrapped = resolveIncomingContent(msg.message);
+    const mentionHit = detectGroupMention(unwrapped);
+    if (mentionHit.ok) {
+      const targets = mentionHit.groupJids.length ? mentionHit.groupJids : [chatJid];
+      for (const gid of targets) {
+        const mentionSetting = resolveMentionRuneSetting(this.db, gid);
+        if (!mentionSetting.enabled) continue;
+        const eventId = `mention:${chatJid}:${msg.key?.id || ''}`;
+        if (!this.db.runes.claimEvent(eventId, 'mention')) return true;
+        const targetMsg = moderationTargetMessage(msg);
+        await enforceRuneViolation({
+          db: this.db,
+          sock: socket,
+          logger: this.logger,
+          rune: 'mention',
+          scope: mentionSetting.scope,
+          chatJid,
+          userJid: senderJid,
+          mode: mentionSetting.mode,
+          punishment: mentionSetting.punishment,
+          msg: targetMsg,
+          groupMeta,
+          botJid,
+          deleteOffending: canDeleteIncomingContent(targetMsg),
+        });
+        return true;
+      }
+    }
 
     const linkSetting = resolveRuneSetting(this.db, chatJid, 'link');
-    const unwrapped = unwrapMessage(msg.message);
     if (linkSetting.enabled && detectLink(text, unwrapped)) {
       const eventId = `link:${chatJid}:${msg.key?.id || ''}`;
       if (!this.db.runes.claimEvent(eventId, 'link')) return true;
       return this.enforceGroupRune({
         socket,
-        msg,
+        msg: moderationTargetMessage(msg),
         chatJid,
         senderJid,
         groupMeta,
@@ -854,6 +938,8 @@ class MessageHandler {
         setting: linkSetting,
       });
     }
+
+    if (isCommand) return false;
 
     if (group.profanity && this.containsProfanity(text)) {
       return this.securityAction({
