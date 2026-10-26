@@ -1296,7 +1296,23 @@ test('linkrune enforcement uses the configured punishment and refuses unknown ki
 
 test('linkrune still enforces for ordinary members under covenant and veil', async (t) => {
   for (const mode of ['covenant', 'veil']) {
+    let executed = 0;
     const { db, socket, handler } = createHarness(t);
+    const echo = {
+      name: 'echo',
+      aliases: [],
+      permissions: ['public'],
+      cooldownMs: 0,
+      async execute() {
+        executed += 1;
+      },
+    };
+    handler.registry = {
+      get: (name) => (name === 'echo' ? echo : null),
+      size: 1,
+      all: () => [echo],
+      categories: () => [],
+    };
     db.setSetting('access_mode', mode);
     db.ensureGroup(GROUP, 'Test Domain');
     db.runes.setSetting(GROUP, 'link', { enabled: true, mode: 'grace' });
@@ -1306,6 +1322,12 @@ test('linkrune still enforces for ordinary members under covenant and veil', asy
     });
     assert.ok(socket.sent.some((entry) => entry.content.delete?.id === `AM-${mode}`), mode);
     assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 1, mode);
+    assert.equal(db.getUser(MEMBER), null, mode);
+
+    const sentAfterLink = socket.sent.length;
+    await handler.processMessage(socket, makeMessage({ id: `CMD-${mode}`, text: '!echo hello' }));
+    assert.equal(executed, 0, mode);
+    assert.equal(socket.sent.length, sentAfterLink, mode);
     assert.equal(db.getUser(MEMBER), null, mode);
   }
 });

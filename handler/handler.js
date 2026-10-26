@@ -443,27 +443,9 @@ class MessageHandler {
     const isOwner = Boolean(ownerJid && (senderJid === ownerJid || senderIds.includes(ownerJid)));
     const isSudo = senderIds.some((id) => this.db.isOperator(id));
 
-    if (!allowsAccess(getAccessMode(this.db), { isOwner, isSudo })) return;
-
-    if (!isOwner && this.db.isGloballyBanned(senderJid)) return;
-
     const group = isGroup
       ? this.db.ensureGroup(chatJid, groupMeta?.subject || null)
       : null;
-
-    this.db.recordActivity(senderJid, { groupJid: isGroup ? chatJid : null });
-
-    if (isGroup && this.db.isBannedFromGroup(chatJid, senderJid) && !isOwner && !isSudo) {
-      if (isBotAdmin(groupMeta, botJid)) {
-        try {
-          await socket.groupParticipantsUpdate(chatJid, [senderJid], 'remove');
-          this.db.logModeration(chatJid, 'exile-enforced', senderJid, botJid, 'Banned soul re-entered');
-        } catch (error) {
-          this.logger.warn(`Failed to enforce group exile: ${error.message}`);
-        }
-      }
-      return;
-    }
 
     const text = getMessageText(msg.message);
     const prefix = resolvePrefix({ group, db: this.db, config: this.config });
@@ -491,6 +473,24 @@ class MessageHandler {
         isCommand: Boolean(parsed),
       });
       if (filtered) return;
+    }
+
+    if (!allowsAccess(getAccessMode(this.db), { isOwner, isSudo })) return;
+
+    if (!isOwner && this.db.isGloballyBanned(senderJid)) return;
+
+    this.db.recordActivity(senderJid, { groupJid: isGroup ? chatJid : null });
+
+    if (isGroup && this.db.isBannedFromGroup(chatJid, senderJid) && !isOwner && !isSudo) {
+      if (isBotAdmin(groupMeta, botJid)) {
+        try {
+          await socket.groupParticipantsUpdate(chatJid, [senderJid], 'remove');
+          this.db.logModeration(chatJid, 'exile-enforced', senderJid, botJid, 'Banned soul re-entered');
+        } catch (error) {
+          this.logger.warn(`Failed to enforce group exile: ${error.message}`);
+        }
+      }
+      return;
     }
 
     if (!parsed) {

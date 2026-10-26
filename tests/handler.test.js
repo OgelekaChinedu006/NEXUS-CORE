@@ -512,6 +512,8 @@ test('COVENANT permits the owner and sudo users and silently ignores ordinary us
   const { db, socket, handler, games } = createHarness(t, { commands: [command] });
   db.setSetting('access_mode', 'covenant');
   db.addOperator(SUDO, OWNER);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.updateGroup(GROUP, { antilink: 1 });
   const game = {
     calls: [],
     onText(session, text) {
@@ -523,8 +525,12 @@ test('COVENANT permits the owner and sudo users and silently ignores ordinary us
   await handler.processMessage(socket, makeMessage({ id: 'W1', text: '!echo hello' }));
   await handler.processMessage(socket, makeMessage({ id: 'W2', text: '!unknown' }));
   await handler.processMessage(socket, makeMessage({ id: 'W3', text: 'game move' }));
+  await handler.processMessage(
+    socket,
+    makeMessage({ id: 'W6', chat: GROUP, sender: MEMBER, text: 'https://example.com' }),
+  );
   assert.equal(executed, 0);
-  assert.equal(socket.sent.length, 0);
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'W6'));
   assert.equal(game.calls.length, 0);
   assert.equal(db.getUser(MEMBER), null);
 
