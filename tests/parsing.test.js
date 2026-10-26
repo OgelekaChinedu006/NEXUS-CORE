@@ -4,8 +4,11 @@ import {
   extractTargets,
   getContextInfo,
   getMessageText,
+  isRecentMessage,
   parseCommand,
+  resolveIncomingContent,
   resolvePrefix,
+  resolveSenderJid,
   unwrapMessage,
 } from '../handler/handler.js';
 import { normalizeJid, toUserJid } from '../lib/helpers.js';
@@ -82,6 +85,33 @@ test('resolvePrefix prefers the group prefix, then the global setting, then conf
   assert.equal(resolvePrefix({ group: { prefix: '?' }, db, config }), '?');
   assert.equal(resolvePrefix({ group: null, db, config }), '#');
   assert.equal(resolvePrefix({ group: null, db: { getSetting: (_key, fallback) => fallback }, config }), '!');
+});
+
+test('resolveSenderJid reads participant, alternate and phone identity fields', () => {
+  assert.equal(
+    resolveSenderJid({ key: { participantAlt: '123:2@lid', remoteJid: '120@g.us' } }, { isGroup: true }),
+    '123@lid',
+  );
+  assert.equal(
+    resolveSenderJid({ key: { participantPn: '111@s.whatsapp.net', remoteJid: '120@g.us' } }, { isGroup: true }),
+    '111@s.whatsapp.net',
+  );
+  assert.equal(
+    resolveSenderJid({ key: { senderPn: '222@s.whatsapp.net', remoteJid: '120@g.us' } }, { isGroup: true }),
+    '222@s.whatsapp.net',
+  );
+});
+
+test('resolveIncomingContent reads protocol edits and recent append timestamps', () => {
+  const edited = resolveIncomingContent({
+    protocolMessage: {
+      type: 'MESSAGE_EDIT',
+      editedMessage: { conversation: 'https://edited.example' },
+    },
+  });
+  assert.equal(getMessageText(edited), 'https://edited.example');
+  assert.equal(isRecentMessage({ messageTimestamp: Math.floor(Date.now() / 1000) }), true);
+  assert.equal(isRecentMessage({ messageTimestamp: 1_000 }), false);
 });
 
 test('JID helpers keep WhatsApp domains and strip device suffixes', () => {

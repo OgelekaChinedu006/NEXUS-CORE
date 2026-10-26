@@ -490,7 +490,7 @@ test('VEIL permits only the owner and silently ignores sudo and ordinary users',
   await handler.processMessage(socket, makeMessage({ id: 'V5', text: 'game move' }));
 
   assert.equal(executed, 0);
-  assert.equal(socket.sent.length, 0);
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'V4'));
   assert.equal(game.calls.length, 0);
   assert.equal(db.getUser(MEMBER), null);
   assert.equal(db.countWarnings(GROUP, MEMBER), 0);

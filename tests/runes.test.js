@@ -147,6 +147,10 @@ function makeMessage({
   text = 'hello',
   fromMe = false,
   message,
+  participantAlt,
+  participantPn,
+  senderPn,
+  messageTimestamp,
 } = {}) {
   return {
     key: {
@@ -154,8 +158,12 @@ function makeMessage({
       remoteJid: chat,
       fromMe,
       ...(sender ? { participant: sender } : {}),
+      ...(participantAlt ? { participantAlt } : {}),
+      ...(participantPn ? { participantPn } : {}),
+      ...(senderPn ? { senderPn } : {}),
     },
     message: message || { conversation: text },
+    ...(messageTimestamp != null ? { messageTimestamp } : {}),
   };
 }
 
@@ -1137,6 +1145,20 @@ test('link detection covers bare hosts and nested invite payloads', () => {
     false,
   );
   assert.equal(detectInvite({}, 'hello'), false);
+  assert.equal(
+    detectLink('just a reply', {
+      extendedTextMessage: {
+        text: 'just a reply',
+        contextInfo: {
+          quotedMessage: { conversation: 'https://quoted.example/should-ignore' },
+        },
+      },
+    }),
+    false,
+  );
+  assert.equal(detectLink('https://mmg.whatsapp.net/v/t62/media.jpg'), false);
+  assert.equal(detectLink('https://media.whatsapp.net/v/t62/file.bin'), false);
+  assert.equal(detectLink('https://scontent.xx.cdn.whatsapp.net/v/t62/x.jpg'), false);
 });
 
 test('linkrune mercy deletes and warns once without escalating', async (t) => {
@@ -1270,6 +1292,134 @@ test('linkrune enforcement uses the configured punishment and refuses unknown ki
   });
   assert.equal(kicked.punished, true);
   assert.deepEqual(sock.removed, [MEMBER]);
+});
+
+test('linkrune still enforces for ordinary members under covenant and veil', async (t) => {
+  for (const mode of ['covenant', 'veil']) {
+    const { db, socket, handler } = createHarness(t);
+    db.setSetting('access_mode', mode);
+    db.ensureGroup(GROUP, 'Test Domain');
+    db.runes.setSetting(GROUP, 'link', { enabled: true, mode: 'grace' });
+    await handler.handleUpsert(socket, {
+      type: 'notify',
+      messages: [makeMessage({ id: `AM-${mode}`, text: 'https://example.com/restricted' })],
+    });
+    assert.ok(socket.sent.some((entry) => entry.content.delete?.id === `AM-${mode}`), mode);
+    assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 1, mode);
+    assert.equal(db.getUser(MEMBER), null, mode);
+  }
+});
+
+test('linkrune resolves participantAlt, LID and phone identity fields', async (t) => {
+  const lid = '123456789012345@lid';
+  const meta = makeGroupMeta({ extra: [{ id: lid, phoneNumber: MEMBER }] });
+  const { db, socket, handler } = createHarness(t, { groupMeta: meta });
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'link', { enabled: true, mode: 'grace' });
+  await handler.processMessage(
+    socket,
+    makeMessage({
+      id: 'ALT1',
+      sender: undefined,
+      participantAlt: lid,
+      text: 'https://example.com/alt',
+    }),
+  );
+  assert.equal(db.runes.getViolationCount(GROUP, lid, 'link') + db.runes.getViolationCount(GROUP, MEMBER, 'link'), 1);
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'ALT1'));
+});
+
+test('linkrune detects command-prefixed URLs, captions, edits and recent appends', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'link', { enabled: true, mode: 'grace' });
+
+  await handler.processMessage(socket, makeMessage({ id: 'CMDURL', text: '!echo https://example.com/cmd' }));
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 1);
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'CMDURL'));
+
+  await handler.processMessage(
+    socket,
+    makeMessage({
+      id: 'CAP1',
+      sender: OTHER,
+      text: '',
+      message: { imageMessage: { caption: 'see https://phish.example/x', url: 'https://mmg.whatsapp.net/v/t62/a.jpg' } },
+    }),
+  );
+  assert.equal(db.runes.getViolationCount(GROUP, OTHER, 'link'), 1);
+
+  const originalId = 'EDIT-ORIG';
+  await handler.handleUpsert(socket, {
+    type: 'notify',
+    messages: [{
+      key: { id: 'EDIT1', remoteJid: GROUP, participant: MEMBER, fromMe: false },
+      message: {
+        protocolMessage: {
+          type: 'MESSAGE_EDIT',
+          key: { id: originalId, remoteJid: GROUP, participant: MEMBER, fromMe: false },
+          editedMessage: { conversation: 'https://edited.example/now' },
+        },
+      },
+    }],
+  });
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 2);
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === originalId));
+
+  await handler.handleUpsert(socket, {
+    type: 'append',
+    messages: [makeMessage({
+      id: 'APP1',
+      sender: OTHER,
+      text: 'https://example.com/append',
+      messageTimestamp: Math.floor(Date.now() / 1000),
+    })],
+  });
+  assert.equal(db.runes.getViolationCount(GROUP, OTHER, 'link'), 2);
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'APP1'));
+});
+
+test('linkrune ignores quoted-only links, WhatsApp media URLs, history and duplicate events', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'link', { enabled: true, mode: 'grace' });
+
+  await handler.processMessage(
+    socket,
+    makeMessage({
+      id: 'Q1',
+      text: 'replying',
+      message: {
+        extendedTextMessage: {
+          text: 'replying',
+          contextInfo: { quotedMessage: { conversation: 'https://quoted.example/nope' } },
+        },
+      },
+    }),
+  );
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 0);
+
+  await handler.processMessage(
+    socket,
+    makeMessage({
+      id: 'CDN1',
+      text: '',
+      message: { imageMessage: { url: 'https://pps.whatsapp.net/v/t61/avatar.jpg', mimetype: 'image/jpeg' } },
+    }),
+  );
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 0);
+
+  await handler.handleUpsert(socket, {
+    type: 'append',
+    messages: [makeMessage({ id: 'OLD1', text: 'https://example.com/old', messageTimestamp: 1_000 })],
+  });
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 0);
+
+  const live = makeMessage({ id: 'DUP-LIVE', text: 'https://example.com/dup' });
+  await handler.processMessage(socket, live);
+  const afterFirst = db.runes.getViolationCount(GROUP, MEMBER, 'link');
+  await handler.processMessage(socket, live);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), afterFirst);
 });
 
 test('linkrune command modes, alias, help and admin permission work', async (t) => {
