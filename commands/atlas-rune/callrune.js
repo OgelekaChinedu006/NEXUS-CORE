@@ -4,7 +4,7 @@ export default {
   name: 'callrune',
   aliases: ['callward'],
   description: 'Configure the Call Rune against private calls to the vessel.',
-  category: 'sovereign',
+  category: 'atlas-rune',
   usage: 'callrune [on|off|mercy|grace|reset @user|status|help]',
   permissions: ['sudo'],
   cooldownMs: 2000,

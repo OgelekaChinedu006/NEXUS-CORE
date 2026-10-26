@@ -103,6 +103,29 @@ test('every roadmap priority command is implemented and loadable', async () => {
   }
 });
 
+test('atlas-rune commands load exactly once from commands/atlas-rune', async () => {
+  const loaded = await registry();
+  const runeNames = ['linkrune', 'mentionrune', 'spamrune', 'botrune', 'callrune'];
+  const categories = loaded.categories();
+  const atlas = categories.find((category) => category.id === 'atlas-rune');
+  assert.ok(atlas);
+  assert.equal(atlas.label, 'ATLAS RUNES');
+  assert.equal(atlas.commands.length, runeNames.length);
+  assert.deepEqual(atlas.commands.map((command) => command.name).sort(), [...runeNames].sort());
+  for (const name of runeNames) {
+    const command = loaded.get(name);
+    assert.equal(command.category, 'atlas-rune');
+    assert.match(command.source, /commands[\\/]atlas-rune[\\/]/);
+    assert.doesNotMatch(command.source, /commands[\\/]security[\\/]/);
+    assert.doesNotMatch(command.source, /commands[\\/]sovereign[\\/]/);
+  }
+  assert.equal(loaded.get('malevolent').category, 'security');
+  assert.equal(loaded.get('overwhelm').category, 'security');
+  assert.equal(loaded.get('lockdown').category, 'domain');
+  assert.match(loaded.get('malevolent').source, /commands[\\/]security[\\/]malevolent\.js$/);
+  assert.doesNotMatch(loaded.get('malevolent').source, /security[\\/]security/);
+});
+
 test('arise renders a menu whose advertised count matches the registry', async () => {
   const loaded = await registry();
   assert.equal(loaded.get('arise'), loaded.get('menu'));

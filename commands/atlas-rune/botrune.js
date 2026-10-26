@@ -7,7 +7,7 @@ export default {
   name: 'botrune',
   aliases: ['botward'],
   description: 'Configure the Bot Rune: Lockdown or Crush Zone.',
-  category: 'security',
+  category: 'atlas-rune',
   usage: 'botrune [on|off|lockdown|crush|status|help]',
   permissions: ['admin'],
   cooldownMs: 2000,
