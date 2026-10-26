@@ -20,6 +20,7 @@ import {
   canCrushRemove,
   classifyCall,
   createJoinTracker,
+  createSpamTracker,
   crushSignals,
   canDeleteIncomingContent,
   detectGroupMention,
@@ -29,6 +30,8 @@ import {
   handleCallRune,
   isExemptFromRunes,
   isStatusMentionOfTarget,
+  mediaFingerprint,
+  normalizeSpamText,
   STATUS_DELETION_UNSUPPORTED,
 } from '../lib/rune-engine.js';
 import { executeRuneCommand } from '../lib/rune-commands.js';
@@ -200,6 +203,27 @@ function createHarness(t, { config = {}, groupMeta, botAdmin = true, socketOptio
   return { db, socket, handler, meta };
 }
 
+async function sendBurst(handler, socket, {
+  prefix,
+  count,
+  sender = MEMBER,
+  chat = GROUP,
+  textFor = (index) => `n${index}`,
+  messageFor = null,
+} = {}) {
+  for (let index = 1; index <= count; index += 1) {
+    const msg = messageFor
+      ? messageFor(index)
+      : makeMessage({
+        id: `${prefix}${index}`,
+        sender,
+        chat,
+        text: textFor(index),
+      });
+    await handler.processMessage(socket, msg);
+  }
+}
+
 function runeCtx(db, overrides = {}) {
   const replies = [];
   const ctx = {
@@ -284,6 +308,17 @@ test('rune schema is created on fresh and existing databases without dropping co
   assert.equal(db.countWarnings(GROUP, MEMBER), 1);
   RuneStore.ensureSchema(db.db);
   assert.equal(db.getGroup(GROUP).antilink, 1);
+  const runeColumns = db.db.prepare('PRAGMA table_info(rune_settings)').all().map((column) => column.name);
+  for (const column of [
+    'spam_flood_count',
+    'spam_flood_window_ms',
+    'spam_repeat_text_count',
+    'spam_repeat_text_window_ms',
+    'spam_repeat_media_count',
+    'spam_repeat_media_window_ms',
+  ]) {
+    assert.ok(runeColumns.includes(column), column);
+  }
 
   const memory = freshDb(t);
   const memoryTables = memory.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name);
@@ -898,13 +933,12 @@ test('spam rune fires once at threshold and does not write generic warnings', as
   const { db, socket, handler } = createHarness(t);
   db.ensureGroup(GROUP, 'Test Domain');
   db.runes.setSetting(GROUP, 'spam', { enabled: true, mode: 'grace' });
-  for (let index = 1; index <= 7; index += 1) {
-    await handler.processMessage(socket, makeMessage({ id: `SP${index}`, text: String(index) }));
-  }
+  await sendBurst(handler, socket, { prefix: 'SP', count: 15, textFor: (index) => String(index) });
   assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
   assert.equal(db.countWarnings(GROUP, MEMBER), 0);
-  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'SP7'));
-  await handler.processMessage(socket, makeMessage({ id: 'SP7', text: 'repeat' }));
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'SP15'));
+  assert.ok(!socket.sent.some((entry) => entry.content.delete?.id === 'SP1'));
+  await handler.processMessage(socket, makeMessage({ id: 'SP15', text: 'repeat' }));
   assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
 });
 
@@ -914,14 +948,364 @@ test('spam rune counts LID and phone aliases of the same member together', async
   const { db, socket, handler } = createHarness(t, { groupMeta: meta });
   db.ensureGroup(GROUP, 'Test Domain');
   db.runes.setSetting(GROUP, 'spam', { enabled: true, mode: 'grace' });
-  for (let index = 1; index <= 4; index += 1) {
+  for (let index = 1; index <= 8; index += 1) {
     await handler.processMessage(socket, makeMessage({ id: `LID${index}`, sender: lid, text: String(index) }));
   }
-  for (let index = 5; index <= 7; index += 1) {
+  for (let index = 9; index <= 15; index += 1) {
     await handler.processMessage(socket, makeMessage({ id: `PN${index}`, sender: MEMBER, text: String(index) }));
   }
   assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
   assert.equal(db.countWarnings(GROUP, MEMBER), 0);
+});
+
+function mediaMessage({ id, sender = MEMBER, sha, enc, mediaKey, directPath, mimetype = 'image/jpeg' } = {}) {
+  return makeMessage({
+    id,
+    sender,
+    text: '',
+    message: {
+      imageMessage: {
+        mimetype,
+        ...(sha ? { fileSha256: sha } : {}),
+        ...(enc ? { fileEncSha256: enc } : {}),
+        ...(mediaKey ? { mediaKey } : {}),
+        ...(directPath ? { directPath } : {}),
+      },
+    },
+  });
+}
+
+test('spam tracker normalizes text and fingerprints media without MIME-only matches', () => {
+  assert.equal(normalizeSpamText('  Hello   WORLD  '), 'hello world');
+  assert.equal(normalizeSpamText('HELLO WORLD'), 'hello world');
+  const same = mediaFingerprint({ imageMessage: { mimetype: 'image/jpeg', fileSha256: 'abc' } });
+  const otherMime = mediaFingerprint({ imageMessage: { mimetype: 'image/png', fileSha256: 'abc' } });
+  const otherSha = mediaFingerprint({ imageMessage: { mimetype: 'image/jpeg', fileSha256: 'xyz' } });
+  assert.equal(same, otherMime);
+  assert.notEqual(same, otherSha);
+  assert.equal(mediaFingerprint({ imageMessage: { mimetype: 'image/jpeg' } }), null);
+  assert.ok(mediaFingerprint({ imageMessage: { fileEncSha256: 'enc1' } }));
+  assert.ok(mediaFingerprint({ imageMessage: { mediaKey: 'k', directPath: '/p/1' } }));
+  assert.equal(mediaFingerprint({ imageMessage: { mediaKey: 'k' } }), null);
+});
+
+test('spam tracker counts distinct messages, skips duplicates, and locks one incident', () => {
+  const tracker = createSpamTracker();
+  const limits = {
+    floodCount: 15,
+    floodWindowMs: 5000,
+    repeatTextCount: 3,
+    repeatTextWindowMs: 10000,
+    repeatMediaCount: 3,
+    repeatMediaWindowMs: 10000,
+  };
+  const base = Date.now();
+  const observe = (id, text, at = base) => tracker.observe({
+    groupJid: GROUP,
+    senderJids: [MEMBER],
+    msg: makeMessage({ id, text }),
+    text,
+    now: at,
+    limits,
+  });
+
+  for (let index = 1; index <= 14; index += 1) {
+    assert.equal(observe(`F${index}`, `t${index}`).hit, false);
+  }
+  const fifteenth = observe('F15', 't15');
+  assert.equal(fifteenth.hit, true);
+  assert.equal(fifteenth.enforce, true);
+  assert.deepEqual(fifteenth.categories, ['flood']);
+  assert.equal(fifteenth.extraDeletes.length, 0);
+
+  const dup = observe('F15', 't15');
+  assert.equal(dup.duplicate, true);
+  assert.equal(dup.hit, false);
+
+  const sixteenth = observe('F16', 't16');
+  assert.equal(sixteenth.hit, true);
+  assert.equal(sixteenth.enforce, false);
+
+  const later = observe('F17', 't17', base + 6000);
+  assert.equal(later.hit, false);
+
+  for (let index = 18; index <= 30; index += 1) {
+    assert.equal(observe(`F${index}`, `t${index}`, base + 6000).hit, false);
+  }
+  const renewed = observe('F31', 't31', base + 6000);
+  assert.equal(renewed.hit, true);
+  assert.equal(renewed.enforce, true);
+});
+
+test('spam rune flood waits until fifteen distinct messages then deletes only the triggering one', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'spam', { enabled: true, mode: 'grace' });
+  await sendBurst(handler, socket, { prefix: 'FL', count: 14 });
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 0);
+  assert.ok(!socket.sent.some((entry) => entry.content.delete));
+
+  await handler.processMessage(socket, makeMessage({ id: 'FL15', text: 'n15' }));
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'FL15'));
+  assert.ok(!socket.sent.some((entry) => ['FL1', 'FL2', 'FL3', 'FL4'].includes(entry.content.delete?.id)));
+
+  await handler.processMessage(socket, makeMessage({ id: 'FL16', text: 'n16' }));
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'FL16'));
+});
+
+test('spam rune repeated text hits on the third copy and keeps the first', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'spam', { enabled: true, mode: 'grace' });
+  await handler.processMessage(socket, makeMessage({ id: 'RT1', text: '  Hello   WORLD  ' }));
+  await handler.processMessage(socket, makeMessage({ id: 'RT2', text: 'hello world' }));
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 0);
+  await handler.processMessage(socket, makeMessage({ id: 'RT3', text: 'HELLO WORLD' }));
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'RT3'));
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'RT2'));
+  assert.ok(!socket.sent.some((entry) => entry.content.delete?.id === 'RT1'));
+
+  await handler.processMessage(socket, makeMessage({ id: 'RT4', text: 'hello world' }));
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'RT4'));
+});
+
+test('spam rune repeated media hits on the third matching fingerprint and ignores MIME-only sameness', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'spam', {
+    enabled: true,
+    mode: 'grace',
+    spamFloodCount: 50,
+    spamFloodWindowMs: 5000,
+  });
+  await handler.processMessage(socket, mediaMessage({ id: 'MD1', sha: 'same-hash' }));
+  await handler.processMessage(socket, mediaMessage({ id: 'MD2', sha: 'same-hash', mimetype: 'image/png' }));
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 0);
+  await handler.processMessage(socket, mediaMessage({ id: 'MD3', sha: 'same-hash' }));
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'MD3'));
+  assert.ok(socket.sent.some((entry) => entry.content.delete?.id === 'MD2'));
+  assert.ok(!socket.sent.some((entry) => entry.content.delete?.id === 'MD1'));
+
+  await handler.processMessage(socket, mediaMessage({ id: 'MD4', sha: 'other-hash', mimetype: 'image/jpeg' }));
+  await handler.processMessage(socket, mediaMessage({ id: 'MD5', sha: 'other-hash' }));
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
+  assert.ok(!socket.sent.some((entry) => entry.content.delete?.id === 'MD4'));
+});
+
+test('spam rune flood and repeat together still count as one incident', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'spam', { enabled: true, mode: 'grace' });
+  await sendBurst(handler, socket, { prefix: 'MX', count: 15, textFor: () => 'same burst' });
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
+  const deletes = socket.sent.filter((entry) => entry.content.delete).map((entry) => entry.content.delete.id);
+  assert.ok(deletes.includes('MX15'));
+  assert.ok(!deletes.includes('MX1'));
+});
+
+test('spam rune counters stay independent per user, group and category', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.ensureGroup(OTHER_GROUP, 'Other Domain');
+  db.runes.setSetting(GROUP, 'spam', { enabled: true, mode: 'grace' });
+  db.runes.setSetting(OTHER_GROUP, 'spam', { enabled: true, mode: 'grace' });
+  db.runes.setSetting(GROUP, 'link', { enabled: true, mode: 'grace' });
+
+  await sendBurst(handler, socket, { prefix: 'IND', count: 14, textFor: (index) => `m${index}` });
+  await handler.processMessage(socket, makeMessage({ id: 'U2A', sender: OTHER, text: 'x' }));
+  await handler.processMessage(socket, makeMessage({ id: 'OG1', chat: OTHER_GROUP, text: 'y' }));
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 0);
+  assert.equal(db.runes.getViolationCount(GROUP, OTHER, 'spam'), 0);
+  assert.equal(db.runes.getViolationCount(OTHER_GROUP, MEMBER, 'spam'), 0);
+
+  await handler.processMessage(socket, makeMessage({ id: 'IND15', text: 'm15' }));
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
+  assert.equal(db.runes.getViolationCount(GROUP, OTHER, 'spam'), 0);
+  assert.equal(db.runes.getViolationCount(OTHER_GROUP, MEMBER, 'spam'), 0);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'link'), 0);
+});
+
+test('spam rune exempts owner, admin, sudo, ally and does not count the bot', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'spam', { enabled: true, mode: 'exile' });
+  db.addOperator(SUDO, OWNER);
+  db.addAlly(GROUP, ALLY, ADMIN);
+
+  for (const sender of [OWNER, ADMIN, SUDO, ALLY, BOT]) {
+    await sendBurst(handler, socket, { prefix: `${sender}-`, count: 16, sender });
+  }
+  assert.equal(db.runes.getViolationCount(GROUP, OWNER, 'spam'), 0);
+  assert.equal(db.runes.getViolationCount(GROUP, ADMIN, 'spam'), 0);
+  assert.equal(db.runes.getViolationCount(GROUP, SUDO, 'spam'), 0);
+  assert.equal(db.runes.getViolationCount(GROUP, ALLY, 'spam'), 0);
+  assert.equal(db.runes.getViolationCount(GROUP, BOT, 'spam'), 0);
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 0);
+  assert.deepEqual(socket.removed, []);
+});
+
+test('spamrune still enforces for ordinary members under covenant and veil', async (t) => {
+  for (const mode of ['covenant', 'veil']) {
+    let executed = 0;
+    const { db, socket, handler } = createHarness(t);
+    const echo = {
+      name: 'echo',
+      aliases: [],
+      permissions: ['public'],
+      cooldownMs: 0,
+      async execute() {
+        executed += 1;
+      },
+    };
+    handler.registry = {
+      get: (name) => (name === 'echo' ? echo : null),
+      size: 1,
+      all: () => [echo],
+      categories: () => [],
+    };
+    db.setSetting('access_mode', mode);
+    db.ensureGroup(GROUP, 'Test Domain');
+    db.runes.setSetting(GROUP, 'spam', { enabled: true, mode: 'grace' });
+    for (let index = 1; index <= 15; index += 1) {
+      await handler.handleUpsert(socket, {
+        type: 'notify',
+        messages: [makeMessage({ id: `SM-${mode}-${index}`, text: `n${index}` })],
+      });
+    }
+    assert.ok(socket.sent.some((entry) => entry.content.delete?.id === `SM-${mode}-15`), mode);
+    assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1, mode);
+    assert.equal(db.getUser(MEMBER), null, mode);
+
+    const sentAfter = socket.sent.length;
+    await handler.processMessage(socket, makeMessage({ id: `SCMD-${mode}`, text: '!echo hello' }));
+    assert.equal(executed, 0, mode);
+    assert.ok(
+      !socket.sent.slice(sentAfter).some((entry) => typeof entry.content.text === 'string' && !entry.content.delete),
+      mode,
+    );
+  }
+});
+
+test('spamrune mercy, grace and exile follow the shared mode contract', async (t) => {
+  const mercy = createHarness(t);
+  mercy.db.ensureGroup(GROUP, 'Test Domain');
+  mercy.db.runes.setSetting(GROUP, 'spam', { enabled: true, mode: 'mercy' });
+  await sendBurst(mercy.handler, mercy.socket, { prefix: 'MY', count: 15 });
+  assert.equal(mercy.db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 0);
+  assert.ok(mercy.socket.sent.some((entry) => entry.content.delete?.id === 'MY15'));
+  assert.ok(mercy.socket.sent.some((entry) => /single warning/i.test(entry.content.text || '')));
+  assert.deepEqual(mercy.socket.removed, []);
+
+  const exile = createHarness(t);
+  exile.db.ensureGroup(GROUP, 'Test Domain');
+  exile.db.runes.setSetting(GROUP, 'spam', { enabled: true, mode: 'exile', punishment: 'kick' });
+  await sendBurst(exile.handler, exile.socket, { prefix: 'EX', count: 15 });
+  assert.deepEqual(exile.socket.removed, [MEMBER]);
+  assert.equal(exile.db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 0);
+  assert.ok(exile.socket.sent.some((entry) => /VERDICT: KICK/.test(entry.content.text || '')));
+});
+
+test('spam rune reports failed delete and failed punishment honestly', async (t) => {
+  const failedDelete = createHarness(t, { socketOptions: { failDelete: true } });
+  failedDelete.db.ensureGroup(GROUP, 'Test Domain');
+  failedDelete.db.runes.setSetting(GROUP, 'spam', { enabled: true, mode: 'grace' });
+  await sendBurst(failedDelete.handler, failedDelete.socket, { prefix: 'FD', count: 15 });
+  assert.equal(failedDelete.db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
+  assert.ok(failedDelete.socket.sent.some((entry) => /Delete failed/i.test(entry.content.text || '')));
+
+  const failedKick = createHarness(t, { socketOptions: { failKick: true } });
+  failedKick.db.ensureGroup(GROUP, 'Test Domain');
+  failedKick.db.runes.setSetting(GROUP, 'spam', { enabled: true, mode: 'exile' });
+  await sendBurst(failedKick.handler, failedKick.socket, { prefix: 'FK', count: 15 });
+  assert.deepEqual(failedKick.socket.removed, []);
+  assert.ok(failedKick.socket.sent.some((entry) => /FAILED/.test(entry.content.text || '')));
+  assert.ok(failedKick.socket.sent.some((entry) => /Punishment failed/i.test(entry.content.text || '')));
+});
+
+test('spam rune reports continued-burst delete failures without re-enforcing', async (t) => {
+  const { db, socket, handler } = createHarness(t);
+  db.ensureGroup(GROUP, 'Test Domain');
+  db.runes.setSetting(GROUP, 'spam', { enabled: true, mode: 'grace' });
+  await sendBurst(handler, socket, { prefix: 'CB', count: 15 });
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
+  const sentAfterFirst = socket.sent.length;
+  const originalSend = socket.sendMessage;
+  socket.sendMessage = async (jid, content, options = {}) => {
+    if (content?.delete) throw new Error('delete refused');
+    return originalSend.call(socket, jid, content, options);
+  };
+
+  await handler.processMessage(socket, makeMessage({ id: 'CB16', text: 'n16' }));
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
+  assert.deepEqual(socket.removed, []);
+  const continued = socket.sent.slice(sentAfterFirst);
+  assert.ok(continued.some((entry) => /Delete failed/i.test(entry.content.text || '')));
+  assert.ok(continued.some((entry) => /FAILED/.test(entry.content.text || '')));
+  assert.ok(!continued.some((entry) => /MARKS:/i.test(entry.content.text || '')));
+  assert.ok(!continued.some((entry) => /single warning/i.test(entry.content.text || '')));
+
+  const sentAfterFlood = socket.sent.length;
+  await handler.processMessage(socket, makeMessage({ id: 'CBR1', text: 'same continued' }));
+  await handler.processMessage(socket, makeMessage({ id: 'CBR2', text: 'same continued' }));
+  await handler.processMessage(socket, makeMessage({ id: 'CBR3', text: 'same continued' }));
+  assert.equal(db.runes.getViolationCount(GROUP, MEMBER, 'spam'), 1);
+  const repeatContinued = socket.sent.slice(sentAfterFlood);
+  assert.ok(repeatContinued.some((entry) => /Repeat delete failed/i.test(entry.content.text || '')));
+  assert.ok(repeatContinued.some((entry) => /Delete failed/i.test(entry.content.text || '')));
+  assert.ok(!repeatContinued.some((entry) => /MARKS:/i.test(entry.content.text || '')));
+});
+
+test('spamrune command modes, thresholds, help and admin permission work', async (t) => {
+  const db = freshDb(t);
+  db.ensureGroup(GROUP, 'Domain');
+  const member = runeCtx(db, { isAdmin: false, senderJid: MEMBER, args: ['on'] });
+  await assert.rejects(() => executeRuneCommand(member.ctx, 'spam'), CommandError);
+
+  for (const mode of ['mercy', 'grace', 'exile']) {
+    const admin = runeCtx(db, { args: [mode] });
+    await executeRuneCommand(admin.ctx, 'spam');
+    const setting = resolveRuneSetting(db, GROUP, 'spam');
+    assert.equal(setting.enabled, true);
+    assert.equal(setting.mode, mode);
+    assert.equal(setting.punishment, 'kick');
+  }
+  const defaults = resolveRuneSetting(db, GROUP, 'spam');
+  assert.equal(defaults.spamLimits.floodCount, 15);
+  assert.equal(defaults.spamLimits.floodWindowMs, 5000);
+  assert.equal(defaults.spamLimits.repeatTextCount, 3);
+  assert.equal(defaults.spamLimits.repeatTextWindowMs, 10000);
+  assert.equal(defaults.spamLimits.repeatMediaCount, 3);
+  assert.equal(defaults.spamLimits.repeatMediaWindowMs, 10000);
+
+  const limits = runeCtx(db, { args: ['flood', '6', '8000', 'text', '4', '12000', 'media', '4', '9000'] });
+  await executeRuneCommand(limits.ctx, 'spam');
+  const configured = resolveRuneSetting(db, GROUP, 'spam');
+  assert.equal(configured.spamLimits.floodCount, 6);
+  assert.equal(configured.spamLimits.floodWindowMs, 8000);
+  assert.equal(configured.spamLimits.repeatTextCount, 4);
+  assert.equal(configured.spamLimits.repeatTextWindowMs, 12000);
+  assert.equal(configured.spamLimits.repeatMediaCount, 4);
+  assert.equal(configured.spamLimits.repeatMediaWindowMs, 9000);
+  assert.match(limits.replies[0].text, /FLOOD: 6 \/ 8000ms/);
+
+  const help = runeCtx(db, { args: ['help'] });
+  await executeRuneCommand(help.ctx, 'spam');
+  const helpText = help.replies[0].text;
+  assert.match(helpText, /mercy\|grace\|exile/);
+  assert.match(helpText, /Flood counts distinct incoming messages/);
+  assert.match(helpText, /first copy is kept/);
+  assert.match(helpText, /never downloads files/);
+
+  const loaded = await loadCommands(path.join(path.resolve(import.meta.dirname, '..'), 'commands'), logger);
+  const command = loaded.get('spamrune');
+  assert.equal(command.aliases.includes('floodrune'), true);
+  assert.equal(loaded.get('floodrune'), command);
+  assert.equal(command.permissions.includes('admin'), true);
 });
 
 test('handler uses rune path for legacy antilink without writing generic warnings', async (t) => {

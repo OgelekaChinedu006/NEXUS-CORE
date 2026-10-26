@@ -23,8 +23,12 @@ import {
   canCrushRemove,
   createJoinTracker,
   createPrefixFloodTracker,
+  createSpamTracker,
   crushSignals,
+  defaultSpamLimits,
+  deleteRuneMessage,
   detectKnownBotPrefix,
+  spamFailureText,
   canDeleteIncomingContent,
   detectGroupMention,
   detectLink,
@@ -224,7 +228,7 @@ class MessageHandler {
     this.metadataCache = new Map();
     this.rateBuckets = new Map();
     this.cooldowns = new Map();
-    this.spamBuckets = new Map();
+    this.spamTracker = createSpamTracker();
     this.securityActions = new Map();
     this.noticeBuckets = new Map();
     this.statusCache = createStatusCache();
@@ -311,11 +315,6 @@ class MessageHandler {
     for (const [key, entry] of this.metadataCache) {
       if (entry.expiresAt < now) this.metadataCache.delete(key);
     }
-    for (const [key, timestamps] of this.spamBuckets) {
-      const fresh = timestamps.filter((stamp) => now - stamp < this.config.security.spamWindowMs);
-      if (fresh.length) this.spamBuckets.set(key, fresh);
-      else this.spamBuckets.delete(key);
-    }
     for (const [key, expiresAt] of this.cooldowns) {
       if (expiresAt < now) this.cooldowns.delete(key);
     }
@@ -348,6 +347,7 @@ class MessageHandler {
     try {
       this.joinTracker.prune(now);
       this.prefixFlood.prune(now);
+      this.spamTracker.prune(now);
     } catch (error) {
       this.logger.debug(`Rune tracker prune failed: ${error.message}`);
     }
@@ -854,17 +854,6 @@ class MessageHandler {
     const senderKeys = identityJids(groupMeta, senderJid);
     const spamKey = `${chatJid}:${senderKeys[0] || senderJid}`;
     const now = Date.now();
-    let bucket = [];
-    for (const id of senderKeys) {
-      const stamps = (this.spamBuckets.get(`${chatJid}:${id}`) || []).filter(
-        (stamp) => now - stamp < this.config.security.spamWindowMs,
-      );
-      if (stamps.length > bucket.length) bucket = stamps;
-    }
-    bucket.push(now);
-    for (const id of senderKeys.length ? senderKeys : [senderJid]) {
-      this.spamBuckets.set(`${chatJid}:${id}`, bucket);
-    }
 
     const mentions = getContextInfo(msg.message)?.mentionedJid || [];
     const botHandled = await this.applyBotRune({
@@ -881,18 +870,20 @@ class MessageHandler {
     if (botHandled) return true;
 
     const spamSetting = resolveRuneSetting(this.db, chatJid, 'spam');
-    if (spamSetting.enabled && bucket.length >= this.config.security.spamThreshold) {
-      const eventId = `spam:${chatJid}:${msg.key?.id || ''}`;
-      if (!this.db.runes.claimEvent(eventId, 'spam')) return true;
-      return this.enforceGroupRune({
+    if (spamSetting.enabled) {
+      const handled = await this.applySpamRune({
         socket,
         msg,
         chatJid,
         senderJid,
+        senderKeys,
         groupMeta,
         botJid,
+        text,
+        now,
         setting: spamSetting,
       });
+      if (handled) return true;
     }
 
     const unwrapped = resolveIncomingContent(msg.message);
@@ -973,6 +964,83 @@ class MessageHandler {
       groupMeta,
       botJid,
       deleteOffending: true,
+    });
+    return true;
+  }
+
+  async applySpamRune({
+    socket,
+    msg,
+    chatJid,
+    senderJid,
+    senderKeys,
+    groupMeta,
+    botJid,
+    text,
+    now,
+    setting,
+  }) {
+    const legacy = setting.source === 'legacy';
+    const limits = legacy
+      ? {
+          floodCount: this.config.security.spamThreshold,
+          floodWindowMs: this.config.security.spamWindowMs,
+          repeatTextCount: 0,
+          repeatTextWindowMs: this.config.security.spamWindowMs,
+          repeatMediaCount: 0,
+          repeatMediaWindowMs: this.config.security.spamWindowMs,
+        }
+      : (setting.spamLimits || defaultSpamLimits());
+    const eventId = `spam:${chatJid}:${msg.key?.id || ''}`;
+    if (this.db.runes.hasEvent(eventId, 'spam')) return true;
+    const observed = this.spamTracker.observe({
+      groupJid: chatJid,
+      senderJids: senderKeys.length ? senderKeys : [senderJid],
+      msg,
+      text,
+      content: resolveIncomingContent(msg.message),
+      now,
+      limits,
+      enableRepeat: !legacy,
+    });
+    if (observed.duplicate) return false;
+    if (!observed.hit) return false;
+    if (!this.db.runes.claimEvent(eventId, 'spam')) return true;
+
+    const extraLines = [];
+    for (const copy of observed.extraDeletes || []) {
+      const result = await deleteRuneMessage(socket, chatJid, copy, this.logger);
+      if (!result.ok) extraLines.push(`Repeat delete failed: ${result.reason}`);
+    }
+
+    if (!observed.enforce) {
+      const deletion = await deleteRuneMessage(socket, chatJid, msg, this.logger);
+      if (!deletion.ok) extraLines.push(`Delete failed: ${deletion.reason}`);
+      if (extraLines.length) {
+        try {
+          await socket.sendMessage(chatJid, { text: spamFailureText(extraLines) });
+        } catch (error) {
+          this.logger.warn(`Spam rune continued-burst notice failed: ${error.message}`);
+        }
+      }
+      return true;
+    }
+
+    await enforceRuneViolation({
+      db: this.db,
+      sock: socket,
+      logger: this.logger,
+      rune: setting.rune,
+      scope: setting.scope,
+      chatJid,
+      userJid: senderJid,
+      mode: setting.mode,
+      punishment: setting.punishment,
+      msg,
+      groupMeta,
+      botJid,
+      deleteOffending: true,
+      extraLines,
     });
     return true;
   }
